@@ -1,0 +1,143 @@
+# Releases on its own.
+#
+# Daily, it asks `cargo xtask upgrade` whether there is a newer naiveproxy:
+# by default the commit SagerNet's cronet-go pins, which it has built, tested
+# and released. If there is, it upgrades the pin, the headers, the bindings,
+# the network errors and the crates' version, checks the result, and commits
+# it to main. Run by hand, it can follow a branch of the naiveproxy fork
+# instead.
+#
+# Then, and on every push to main that changes Cargo.toml, a version without
+# a tag yet is released: libcronet is built for every target, and the
+# release `v<version>` carries all of it.
+
+name: release
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  push:
+    branches: [main]
+    paths: [Cargo.toml]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Follow the head of this branch of the naiveproxy fork (such as cronet-go-dev-v154) instead of cronet-go's pin.
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  upgrade:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-24.04
+    outputs:
+      ref: ${{ steps.commit.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - id: upgrade
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          if [ -n "$BRANCH" ]; then
+            cargo xtask upgrade --branch "$BRANCH"
+          else
+            cargo xtask upgrade
+          fi
+      - name: Check the upgrade
+        if: steps.upgrade.outputs.changed == 'true'
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --workspace --all-features
+      - name: Commit the upgrade
+        id: commit
+        if: steps.upgrade.outputs.changed == 'true'
+        env:
+          CHROMIUM: ${{ steps.upgrade.outputs.chromium }}
+          COMMIT: ${{ steps.upgrade.outputs.commit }}
+          VERSION: ${{ steps.upgrade.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Upgrade to Chromium $CHROMIUM" -m "naiveproxy $COMMIT; crates $VERSION."
+          git push origin HEAD:main
+          echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  plan:
+    needs: upgrade
+    if: always() && (needs.upgrade.result == 'success' || needs.upgrade.result == 'skipped')
+    runs-on: ubuntu-24.04
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      ref: ${{ steps.plan.outputs.ref }}
+      version: ${{ steps.plan.outputs.version }}
+      chromium: ${{ steps.plan.outputs.chromium }}
+      naiveproxy: ${{ steps.plan.outputs.naiveproxy }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.upgrade.outputs.ref || github.sha }}
+      - id: plan
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          {
+            echo "version=$version"
+            echo "ref=$(git rev-parse HEAD)"
+            echo "chromium=$(cat crates/cronet-sys/include/CHROMIUM_VERSION)"
+            echo "naiveproxy=$(git ls-files -s naiveproxy | cut -d' ' -f2)"
+          } >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+            echo "v$version is already released."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$version is new: releasing it."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    uses: ./.github/workflows/libcronet.yml
+    with:
+      ref: ${{ needs.plan.outputs.ref }}
+
+  release:
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: libcronet-*
+          merge-multiple: true
+          path: assets
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          REF: ${{ needs.plan.outputs.ref }}
+          CHROMIUM: ${{ needs.plan.outputs.chromium }}
+          NAIVEPROXY: ${{ needs.plan.outputs.naiveproxy }}
+        run: |
+          cat > notes.md <<EOF
+          libcronet from naiveproxy [\`${NAIVEPROXY:0:12}\`](https://github.com/SagerNet/naiveproxy/commit/$NAIVEPROXY), Chromium $CHROMIUM, for every supported target.
+
+          Each \`libcronet-<triple>.tar.xz\` holds the library, \`cronet.link\` (what a static link also needs), \`VERSION\`, and Chromium's \`LICENSE\`. See the README for linking or loading it.
+          EOF
+          gh release create "v$VERSION" assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$REF" \
+            --title "v$VERSION (Chromium $CHROMIUM)" \
+            --notes-file notes.md

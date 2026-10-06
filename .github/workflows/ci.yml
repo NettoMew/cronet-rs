@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      # Linked and loaded builds compile different code; lint both.
+      - run: cargo clippy --workspace --all-targets --features cronet/tokio,cronet/http -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy -p xtask --all-targets -- -D warnings
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      # Loaded at run time, nothing needs libcronet to link, and the tests
+      # that need it skip themselves without it.
+      - run: cargo test --workspace --all-features
+      - run: cargo test -p xtask
+
+  # The tests that call into Cronet, against the latest released library of
+  # this repository, both loaded at run time and linked.
+  runtime:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            triple: x86_64-unknown-linux-gnu
+            library: libcronet.so
+          - os: windows-2025
+            triple: x86_64-pc-windows-msvc
+            library: cronet.dll
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Download libcronet
+        id: library
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/libcronet"
+          if gh release download --repo "$GITHUB_REPOSITORY" --pattern "libcronet-${{ matrix.triple }}.tar.xz" \
+              --dir "$RUNNER_TEMP"; then
+            tar xJf "$RUNNER_TEMP/libcronet-${{ matrix.triple }}.tar.xz" -C "$RUNNER_TEMP/libcronet" --strip-components=1
+            echo "dir=$RUNNER_TEMP/libcronet" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No released libcronet for ${{ matrix.triple }} yet; runtime tests skipped."
+          fi
+      - name: Test, loading the library
+        if: steps.library.outputs.dir
+        shell: bash
+        env:
+          CRONET_LIBRARY: ${{ steps.library.outputs.dir }}/${{ matrix.library }}
+        run: cargo test --workspace --all-features
+      - name: Test, linking the library
+        if: steps.library.outputs.dir
+        shell: bash
+        env:
+          CRONET_LIB_DIR: ${{ steps.library.outputs.dir }}
+          CRONET_LINK_KIND: dylib
+          LD_LIBRARY_PATH: ${{ steps.library.outputs.dir }}
+        run: |
+          export PATH="$CRONET_LIB_DIR:$PATH"
+          cargo test -p cronet --features tokio,http

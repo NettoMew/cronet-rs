@@ -1,0 +1,187 @@
+# Builds libcronet from the naiveproxy submodule for every supported target,
+# laid out the way naiveproxy's own CI builds its releases. Each package is an
+# artifact `libcronet-<triple>`; on a release published by hand, it is also
+# attached to it. `release.yml` calls this for the releases it makes.
+
+name: libcronet
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: The commit to build.
+        type: string
+        required: true
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CACHE_EPOCH: 1
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        triple:
+          - x86_64-unknown-linux-gnu
+          - i686-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+          - riscv64gc-unknown-linux-gnu
+          - loongarch64-unknown-linux-gnu
+          - mipsel-unknown-linux-gnu
+          - mips64el-unknown-linux-gnuabi64
+          - x86_64-unknown-linux-musl
+          - i686-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+          - mipsel-unknown-linux-musl
+          - riscv64gc-unknown-linux-musl
+          - loongarch64-unknown-linux-musl
+          - aarch64-linux-android
+          - x86_64-linux-android
+          - armv7-linux-androideabi
+          - i686-linux-android
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: true
+      - uses: actions/cache@v4
+        with:
+          path: |
+            naiveproxy/src/third_party/llvm-build/Release+Asserts/
+            naiveproxy/src/gn/
+            naiveproxy/src/chrome/build/pgo_profiles/
+            naiveproxy/src/third_party/android_toolchain/
+            naiveproxy/src/out/sysroot-build/
+          key: toolchain-${{ matrix.triple }}-${{ hashFiles('naiveproxy/CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ matrix.triple }}-${{ hashFiles('naiveproxy/CHROMIUM_VERSION') }}-${{ github.run_id }}
+          restore-keys: ccache-${{ matrix.triple }}-${{ hashFiles('naiveproxy/CHROMIUM_VERSION') }}-
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build ccache
+      - name: Regenerate the Debian keyring
+        working-directory: naiveproxy/src
+        run: |
+          rm -f ./build/linux/sysroot_scripts/keyring.gpg
+          GPG_TTY=/dev/null ./build/linux/sysroot_scripts/generate_keyring.sh
+      - run: cargo xtask build --target ${{ matrix.triple }}
+      - run: cargo xtask package --target ${{ matrix.triple }}
+      - name: Test against the build
+        if: matrix.triple == 'x86_64-unknown-linux-gnu'
+        env:
+          CRONET_LIBRARY: ${{ github.workspace }}/lib/${{ matrix.triple }}/libcronet.so
+        run: cargo test --workspace --all-features
+      - name: Pack
+        run: tar cJf libcronet-${{ matrix.triple }}.tar.xz -C lib ${{ matrix.triple }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libcronet-${{ matrix.triple }}
+          path: libcronet-${{ matrix.triple }}.tar.xz
+      - if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" libcronet-${{ matrix.triple }}.tar.xz --clobber
+
+  windows:
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        triple: [x86_64-pc-windows-msvc, i686-pc-windows-msvc, aarch64-pc-windows-msvc]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: true
+      - uses: actions/cache@v4
+        with:
+          path: |
+            naiveproxy/src/third_party/llvm-build/Release+Asserts/
+            naiveproxy/src/gn/
+            naiveproxy/src/chrome/build/pgo_profiles/
+            ~/.cargo/bin/sccache.exe
+          key: toolchain-${{ matrix.triple }}-${{ hashFiles('naiveproxy/CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/Mozilla/sccache
+          key: sccache-${{ matrix.triple }}-${{ hashFiles('naiveproxy/CHROMIUM_VERSION') }}-${{ github.run_id }}
+          restore-keys: sccache-${{ matrix.triple }}-${{ hashFiles('naiveproxy/CHROMIUM_VERSION') }}-
+      - run: choco install ninja --no-progress
+      # get-clang.sh installs sccache in ~/.cargo/bin.
+      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - run: cargo xtask build --target ${{ matrix.triple }}
+      - run: cargo xtask package --target ${{ matrix.triple }}
+      - name: Test against the build
+        if: matrix.triple == 'x86_64-pc-windows-msvc'
+        env:
+          CRONET_LIBRARY: ${{ github.workspace }}/lib/${{ matrix.triple }}/cronet.dll
+        run: cargo test --workspace --all-features
+      - name: Pack
+        run: tar cJf libcronet-${{ matrix.triple }}.tar.xz -C lib ${{ matrix.triple }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libcronet-${{ matrix.triple }}
+          path: libcronet-${{ matrix.triple }}.tar.xz
+      - if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" libcronet-${{ matrix.triple }}.tar.xz --clobber
+
+  apple:
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        triple:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+          - aarch64-apple-ios
+          - aarch64-apple-ios-sim
+          - x86_64-apple-ios
+          - aarch64-apple-tvos
+          - aarch64-apple-tvos-sim
+          - x86_64-apple-tvos
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: true
+      - uses: actions/cache@v4
+        with:
+          path: |
+            naiveproxy/src/third_party/llvm-build/Release+Asserts/
+            naiveproxy/src/gn/
+            naiveproxy/src/chrome/build/pgo_profiles/
+          key: toolchain-${{ matrix.triple }}-${{ hashFiles('naiveproxy/CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/ccache
+          key: ccache-${{ matrix.triple }}-${{ hashFiles('naiveproxy/CHROMIUM_VERSION') }}-${{ github.run_id }}
+          restore-keys: ccache-${{ matrix.triple }}-${{ hashFiles('naiveproxy/CHROMIUM_VERSION') }}-
+      - run: brew install ninja ccache
+      - run: pip install setuptools
+      - run: cargo xtask build --target ${{ matrix.triple }}
+      - run: cargo xtask package --target ${{ matrix.triple }}
+      - name: Pack
+        run: tar cJf libcronet-${{ matrix.triple }}.tar.xz -C lib ${{ matrix.triple }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libcronet-${{ matrix.triple }}
+          path: libcronet-${{ matrix.triple }}.tar.xz
+      - if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" libcronet-${{ matrix.triple }}.tar.xz --clobber

@@ -1,0 +1,21 @@
+[package]
+name = "cronet-sys"
+description = "Raw bindings to Cronet's C API, as built by naiveproxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+links = "cronet"
+keywords = ["cronet", "chromium", "ffi", "naiveproxy"]
+categories = ["external-ffi-bindings", "network-programming"]
+
+[features]
+## Open libcronet at run time instead of linking it.
+dynamic = ["dep:libloading"]
+
+[dependencies]
+libloading = { version = "0.9", optional = true }
+
+[lints]
+workspace = true
