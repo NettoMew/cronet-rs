@@ -144,7 +144,7 @@ jobs:
         run: gh release upload "${{ github.event.release.tag_name }}" libcronet-${{ matrix.triple }}.tar.xz --clobber
 
   apple:
-    runs-on: macos-15
+    runs-on: macos-26
     strategy:
       fail-fast: false
       matrix:
