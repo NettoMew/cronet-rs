@@ -54,7 +54,7 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
           submodules: true
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             naiveproxy/src/third_party/llvm-build/Release+Asserts/
@@ -63,7 +63,7 @@ jobs:
             naiveproxy/src/third_party/android_toolchain/
             naiveproxy/src/out/sysroot-build/
           key: toolchain-${{ matrix.triple }}-${{ hashFiles('naiveproxy/CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ~/.cache/ccache
           key: ccache-${{ matrix.triple }}-${{ hashFiles('naiveproxy/CHROMIUM_VERSION') }}-${{ github.run_id }}
@@ -83,7 +83,7 @@ jobs:
         run: cargo test --workspace --all-features
       - name: Pack
         run: tar cJf libcronet-${{ matrix.triple }}.tar.xz -C lib ${{ matrix.triple }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: libcronet-${{ matrix.triple }}
           path: libcronet-${{ matrix.triple }}.tar.xz
@@ -106,7 +106,7 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
           submodules: true
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             naiveproxy/src/third_party/llvm-build/Release+Asserts/
@@ -114,7 +114,7 @@ jobs:
             naiveproxy/src/chrome/build/pgo_profiles/
             ~/.cargo/bin/sccache.exe
           key: toolchain-${{ matrix.triple }}-${{ hashFiles('naiveproxy/CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ~/AppData/Local/Mozilla/sccache
           key: sccache-${{ matrix.triple }}-${{ hashFiles('naiveproxy/CHROMIUM_VERSION') }}-${{ github.run_id }}
@@ -131,7 +131,7 @@ jobs:
         run: cargo test --workspace --all-features
       - name: Pack
         run: tar cJf libcronet-${{ matrix.triple }}.tar.xz -C lib ${{ matrix.triple }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: libcronet-${{ matrix.triple }}
           path: libcronet-${{ matrix.triple }}.tar.xz
@@ -159,14 +159,14 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
           submodules: true
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             naiveproxy/src/third_party/llvm-build/Release+Asserts/
             naiveproxy/src/gn/
             naiveproxy/src/chrome/build/pgo_profiles/
           key: toolchain-${{ matrix.triple }}-${{ hashFiles('naiveproxy/CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ~/Library/Caches/ccache
           key: ccache-${{ matrix.triple }}-${{ hashFiles('naiveproxy/CHROMIUM_VERSION') }}-${{ github.run_id }}
@@ -177,7 +177,7 @@ jobs:
       - run: cargo xtask package --target ${{ matrix.triple }}
       - name: Pack
         run: tar cJf libcronet-${{ matrix.triple }}.tar.xz -C lib ${{ matrix.triple }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: libcronet-${{ matrix.triple }}
           path: libcronet-${{ matrix.triple }}.tar.xz
