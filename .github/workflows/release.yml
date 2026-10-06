@@ -108,15 +108,18 @@ jobs:
             echo "release=true" >> "$GITHUB_OUTPUT"
           fi
 
+  # On a push, upgrade is skipped, and without a status check of their own
+  # these would be skipped with it.
   build:
     needs: plan
-    if: needs.plan.outputs.release == 'true'
+    if: ${{ !cancelled() && needs.plan.outputs.release == 'true' }}
     uses: ./.github/workflows/libcronet.yml
     with:
       ref: ${{ needs.plan.outputs.ref }}
 
   release:
     needs: [plan, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v8
