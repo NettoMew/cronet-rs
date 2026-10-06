@@ -1,7 +1,8 @@
-# Builds libcronet from the naiveproxy submodule for every supported target,
-# laid out the way naiveproxy's own CI builds its releases. Each package is an
-# artifact `libcronet-<triple>`; on a release published by hand, it is also
-# attached to it. `release.yml` calls this for the releases it makes.
+# Builds libcronet for every supported target from the naiveproxy commit
+# naiveproxy.lock names, laid out the way naiveproxy's own CI builds its
+# releases. Each package is an artifact `libcronet-<triple>`; on a release
+# published by hand, it is also attached to it. `release.yml` calls this for
+# the releases it makes.
 
 name: libcronet
 
@@ -53,7 +54,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
-          submodules: true
+      # The locked naiveproxy, before its caches are restored into it.
+      - run: cargo xtask fetch
       - uses: actions/cache@v6
         with:
           path: |
@@ -105,7 +107,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
-          submodules: true
+      # The locked naiveproxy, before its caches are restored into it.
+      - run: cargo xtask fetch
       - uses: actions/cache@v6
         with:
           path: |
@@ -158,7 +161,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
-          submodules: true
+      # The locked naiveproxy, before its caches are restored into it.
+      - run: cargo xtask fetch
       - uses: actions/cache@v6
         with:
           path: |

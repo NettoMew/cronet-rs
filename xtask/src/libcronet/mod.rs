@@ -1,4 +1,5 @@
-//! Building libcronet from the naiveproxy submodule.
+//! Building libcronet from naiveproxy, checked out at the locked commit
+//! (see [`crate::lock`]) into `naiveproxy/`.
 //!
 //! naiveproxy's own scripts do the heavy lifting: `get-clang.sh` fetches
 //! Chromium's clang, GN, PGO profiles, the NDK, and the Debian or OpenWrt
@@ -16,7 +17,7 @@ use anyhow::{Context, Result, bail};
 pub(crate) use targets::Target;
 use targets::{Output, TARGETS};
 
-use crate::{Workspace, bindgen, output, run};
+use crate::{Workspace, bindgen, lock, output, run};
 
 /// Which targets a command works on.
 #[derive(clap::Args)]
@@ -82,6 +83,7 @@ fn out_dir(target: &Target) -> String {
 
 /// Fetches what building `targets` needs, without building.
 pub(crate) fn toolchain(workspace: &Workspace, targets: &[&Target]) -> Result<()> {
+    lock::fetch(workspace)?;
     for target in targets {
         eprintln!("[xtask] fetching the toolchain for {target}");
         run(&mut script(workspace, target, "./get-clang.sh"))?;
@@ -218,6 +220,7 @@ pub(crate) const HEADERS: [&str; 4] = [
 /// (regenerating its bindings), and each target's libraries into
 /// `lib/<triple>/`.
 pub(crate) fn package(workspace: &Workspace, targets: &[&Target]) -> Result<()> {
+    lock::fetch(workspace)?;
     for header in HEADERS {
         let name = Path::new(header).file_name().expect("headers are files");
         copy(&workspace.src_root().join(header), &workspace.sys_include().join(name))?;
@@ -312,6 +315,7 @@ fn link_manifest(ninja: &str) -> String {
 /// library: `CRONET_LIB_DIR`, and for Linux the linker and sysroot of the
 /// build, since the library expects Chromium's clang and `lld`.
 pub(crate) fn env(workspace: &Workspace, target: &Target, export: bool) -> Result<()> {
+    lock::fetch(workspace)?;
     let package = workspace.lib_root().join(target.triple);
     let mut variables = vec![("CRONET_LIB_DIR".to_owned(), package.display().to_string())];
 

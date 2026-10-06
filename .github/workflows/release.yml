@@ -2,7 +2,7 @@
 #
 # Daily, it asks `cargo xtask upgrade` whether there is a newer naiveproxy:
 # by default the commit SagerNet's cronet-go pins, which it has built, tested
-# and released. If there is, it upgrades the pin, the headers, the bindings,
+# and released. If there is, it moves naiveproxy.lock, the headers, the bindings,
 # the network errors and the crates' version, checks the result, and commits
 # it to main. Run by hand, it can follow a branch of the naiveproxy fork
 # instead.
@@ -98,7 +98,7 @@ jobs:
             echo "version=$version"
             echo "ref=$(git rev-parse HEAD)"
             echo "chromium=$(cat crates/cronet-sys/include/CHROMIUM_VERSION)"
-            echo "naiveproxy=$(git ls-files -s naiveproxy | cut -d' ' -f2)"
+            echo "naiveproxy=$(grep '^commit = ' naiveproxy.lock | cut -d'"' -f2)"
           } >> "$GITHUB_OUTPUT"
           if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
             echo "v$version is already released."

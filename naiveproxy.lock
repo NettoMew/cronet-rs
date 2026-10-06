@@ -1,0 +1,5 @@
+# The naiveproxy commit libcronet is built from, and that the headers, Chromium
+# version, bindings and network errors in this repository come from.
+# `cargo xtask upgrade` moves it; `cargo xtask fetch` checks it out.
+repository = "https://github.com/SagerNet/naiveproxy"
+commit = "72a06c9fca0e2d228588c7f3074bf7efff3ff686"

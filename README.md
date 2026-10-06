@@ -9,7 +9,7 @@ UDP dialers, custom root certificates, and closing every connection on demand.
 |---|---|
 | [`cronet-sys`](crates/cronet-sys) | The C API, generated from the headers in `crates/cronet-sys/include`. Links libcronet, or (feature `dynamic`) opens it at run time. |
 | [`cronet`](crates/cronet) | A safe API over it: engines, URL requests, bidirectional streams, Chromium's network errors. |
-| [`xtask`](xtask) | Builds libcronet from the `naiveproxy` submodule, packages it, regenerates the bindings. |
+| [`xtask`](xtask) | Builds libcronet from the naiveproxy commit in `naiveproxy.lock`, packages it, regenerates the bindings, upgrades. |
 
 ## Using it
 
@@ -95,13 +95,15 @@ Then either:
 ## Building libcronet
 
 ```sh
-git submodule update --init --depth 1 naiveproxy
 cargo xtask build --target x86_64-unknown-linux-gnu   # several --target, or `all`
 cargo xtask package --target x86_64-unknown-linux-gnu # into lib/<triple>/
 eval "$(cargo xtask env --target x86_64-unknown-linux-gnu --export)"
 ```
 
-The build runs naiveproxy's own `get-clang.sh`, which fetches Chromium's
+The build first checks out the naiveproxy commit `naiveproxy.lock` names
+into `naiveproxy/` (`cargo xtask fetch`, shallow, ignored by git; a large
+part of Chromium, so nothing that merely depends on these crates downloads
+it). It then runs naiveproxy's own `get-clang.sh`, which fetches Chromium's
 clang, GN, PGO profiles, and the Debian, OpenWrt or Android sysroot the target
 needs, then builds Cronet's `cronet_static` (and `cronet`, where Chromium
 offers it) with naiveproxy's release configuration. Hosts are those
@@ -115,8 +117,10 @@ workflow builds them all.
 
 ## Versions and releases
 
-`cronet_sys::CHROMIUM_VERSION` names the Chromium release the bindings come
-from; a matching library reports the same from `Engine::version`.
+`naiveproxy.lock` names the naiveproxy commit everything comes from: the
+headers, the bindings, the network errors and every released library.
+`cronet_sys::CHROMIUM_VERSION` names its Chromium release; a matching library
+reports the same from `Engine::version`.
 
 The [`release`](.github/workflows/release.yml) workflow keeps both moving:
 
@@ -125,9 +129,10 @@ The [`release`](.github/workflows/release.yml) workflow keeps both moving:
   tested and released; it never moves to an older Chromium. Run by hand, the
   workflow can follow a branch of the naiveproxy fork instead, such as
   `cronet-go-dev-v154`.
-- An upgrade brings along the headers, the bindings, the network error table
-  and the crates' version: a new minor version when the C API changed, a
-  patch otherwise. It is checked, then committed to `main`.
+- An upgrade moves `naiveproxy.lock`, and brings along the headers, the
+  bindings, the network error table and the crates' version: a new minor
+  version when the C API changed, a patch otherwise. It is checked, then
+  committed to `main`.
 - **Any version without a tag**, from an upgrade or from a push that edits
   `Cargo.toml`, is released: libcronet is built for every target, and the
   release `v<version>` carries every package.

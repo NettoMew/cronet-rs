@@ -1,12 +1,14 @@
 //! Maintenance tasks for cronet-rs: `cargo xtask <command>`.
 //!
 //! `bindgen` and `net-errors` regenerate checked-in sources, and `upgrade`
-//! moves to a newer naiveproxy with everything derived from it. `toolchain`,
-//! `build`, `package` and `env` build libcronet from the `naiveproxy`
-//! submodule with naiveproxy's own scripts, and package it under `lib/`.
+//! moves `naiveproxy.lock` to a newer naiveproxy with everything derived from
+//! it. `fetch`, `toolchain`, `build`, `package` and `env` check the locked
+//! naiveproxy out, build libcronet from it with naiveproxy's own scripts, and
+//! package it under `lib/`.
 
 mod bindgen;
 mod libcronet;
+mod lock;
 mod net_errors;
 mod upgrade;
 
@@ -32,17 +34,19 @@ enum Task {
     Bindgen,
     /// Regenerate `cronet::NetError` from Chromium's `net_error_list.h`.
     NetErrors {
-        /// Defaults to the copy in the naiveproxy submodule.
+        /// Defaults to the copy in the naiveproxy checkout.
         #[arg(long)]
         source: Option<PathBuf>,
     },
+    /// Check out the commit `naiveproxy.lock` names into `naiveproxy/`.
+    Fetch,
     /// Fetch clang, GN and the sysroot a build needs, without building.
     Toolchain(libcronet::Targets),
     /// Build libcronet.
     Build(libcronet::Targets),
     /// Copy built libraries into `lib/<triple>/`, and the headers into `cronet-sys`.
     Package(libcronet::Targets),
-    /// Move the naiveproxy pin to the commit cronet-go pins, with the headers, bindings,
+    /// Move `naiveproxy.lock` to the commit cronet-go pins, with the headers, bindings,
     /// network errors and crate version that follow from it.
     Upgrade {
         /// The head of this branch of the naiveproxy fork, instead of the
@@ -77,6 +81,7 @@ fn execute(task: Task, workspace: &Workspace) -> Result<()> {
     match task {
         Task::Bindgen => bindgen::run(workspace),
         Task::NetErrors { source } => net_errors::run(workspace, source),
+        Task::Fetch => lock::fetch(workspace),
         Task::Toolchain(targets) => libcronet::toolchain(workspace, &targets.resolve()?),
         Task::Build(targets) => libcronet::build(workspace, &targets.resolve()?),
         Task::Package(targets) => libcronet::package(workspace, &targets.resolve()?),
@@ -109,12 +114,12 @@ impl Workspace {
         &self.root
     }
 
-    /// The naiveproxy submodule.
+    /// The naiveproxy checkout, made by `cargo xtask fetch`.
     pub(crate) fn naive_root(&self) -> PathBuf {
         self.root.join("naiveproxy")
     }
 
-    /// Chromium's source tree inside the submodule.
+    /// Chromium's source tree inside the checkout.
     pub(crate) fn src_root(&self) -> PathBuf {
         self.naive_root().join("src")
     }

@@ -9,15 +9,16 @@
 //! branch of the naiveproxy fork instead, such as a newer
 //! `cronet-go-dev-v<major>`; `--to` takes a given commit.
 //!
-//! The files come straight from GitHub at the new commit, so the submodule,
-//! all of Chromium, never has to be checked out.
+//! The files come straight from GitHub at the new commit, so naiveproxy, a
+//! large part of Chromium, never has to be checked out; the new commit goes
+//! into `naiveproxy.lock`.
 
 use std::{env, fs, io::Write as _, path::Path, process::Command, sync::LazyLock};
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 
-use crate::{Workspace, bindgen, libcronet, net_errors, output};
+use crate::{Workspace, bindgen, libcronet, lock::Lock, net_errors, output};
 
 /// The project whose naiveproxy pin is followed by default.
 const REFERENCE: &str = "SagerNet/cronet-go";
@@ -35,8 +36,8 @@ pub(crate) enum Source {
 }
 
 pub(crate) fn run(workspace: &Workspace, source: Source) -> Result<()> {
-    let url = submodule_url(workspace)?;
-    let current = pinned(workspace)?;
+    let mut lock = Lock::read(workspace)?;
+    let (url, current) = (lock.repository.clone(), lock.commit.clone());
     let target = match &source {
         Source::Reference => reference_pin()?,
         Source::Branch(branch) => branch_head(&url, branch)?,
@@ -84,16 +85,8 @@ pub(crate) fn run(workspace: &Workspace, source: Source) -> Result<()> {
     fs::write(&net_error_list, fetch("src/net/base/net_error_list.h")?)?;
     net_errors::run(workspace, Some(net_error_list))?;
 
-    crate::run(
-        Command::new("git")
-            .args([
-                "update-index",
-                "--add",
-                "--cacheinfo",
-                &format!("160000,{target},naiveproxy"),
-            ])
-            .current_dir(workspace.root()),
-    )?;
+    lock.commit.clone_from(&target);
+    lock.write(workspace)?;
 
     // A changed C API may change what the crates offer: a breaking version.
     // Otherwise only the library moved: a patch.
@@ -119,33 +112,6 @@ fn short(commit: &str) -> &str {
 /// `150.0.7871.63` as numbers, to compare versions.
 fn chromium_order(version: &str) -> Vec<u64> {
     version.split('.').map(|part| part.parse().unwrap_or(0)).collect()
-}
-
-/// The submodule's URL, from `.gitmodules`.
-fn submodule_url(workspace: &Workspace) -> Result<String> {
-    let text = fs::read_to_string(workspace.root().join(".gitmodules"))?;
-    text.lines()
-        .find_map(|line| {
-            line.trim()
-                .strip_prefix("url")?
-                .trim_start()
-                .strip_prefix('=')
-                .map(|url| url.trim().to_owned())
-        })
-        .context(".gitmodules has no url")
-}
-
-/// The commit the workspace pins.
-fn pinned(workspace: &Workspace) -> Result<String> {
-    let entry = output(
-        Command::new("git")
-            .args(["ls-files", "-s", "naiveproxy"])
-            .current_dir(workspace.root()),
-    )?;
-    match entry.split_whitespace().collect::<Vec<_>>()[..] {
-        ["160000", commit, ..] => Ok(commit.to_owned()),
-        _ => bail!("naiveproxy is not a submodule here: {entry:?}"),
-    }
 }
 
 /// The commit [`REFERENCE`]'s default branch pins its `naiveproxy` at, through
