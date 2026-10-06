@@ -47,8 +47,12 @@ impl Targets {
 }
 
 /// Runs one of naiveproxy's scripts in its source tree, for `target`.
+///
+/// They are POSIX shell scripts. `sh`, not `bash`: on Windows, programs are
+/// looked up in System32 before `PATH`, and the `bash` there is WSL's, while
+/// the only `sh` is Git's.
 fn script(workspace: &Workspace, target: &Target, script: &str) -> Command {
-    let mut command = Command::new("bash");
+    let mut command = Command::new("sh");
     command
         .arg("-c")
         .arg(script)
@@ -95,7 +99,6 @@ fn gn_args(workspace: &Workspace, target: &Target) -> Result<String> {
         "is_chrome_branded=true",
         "exclude_unwind_tables=true",
         "enable_resource_allowlist_generation=false",
-        "chrome_pgo_phase=2",
         "symbol_level=0",
         "is_clang=true",
         "use_sysroot=false",
@@ -135,7 +138,11 @@ fn gn_args(workspace: &Workspace, target: &Target) -> Result<String> {
     .map(str::to_owned)
     .collect::<Vec<_>>();
 
-    match target.gn_arg("target_os") {
+    let os = target.gn_arg("target_os");
+    // Optimized with the profiles `get-clang.sh` fetches, which it does for
+    // every platform but iOS.
+    args.push(format!("chrome_pgo_phase={}", if os == Some("ios") { 0 } else { 2 }));
+    match os {
         Some("mac") => args.extend(
             [
                 "mac_allow_system_xcode_for_official_builds_for_testing=true",
@@ -144,14 +151,14 @@ fn gn_args(workspace: &Workspace, target: &Target) -> Result<String> {
             .map(Into::into),
         ),
         Some("ios") => args.extend(["ios_enable_code_signing=false", "enable_dsyms=false"].map(Into::into)),
-        Some("android") => args.extend(
-            [
-                "is_desktop_android=true",
-                "default_min_sdk_version=24",
-                "is_high_end_android=true",
-            ]
-            .map(Into::into),
-        ),
+        Some("android") => {
+            args.extend(["is_desktop_android=true", "default_min_sdk_version=24"].map(Into::into));
+            // Chromium defines the version codes `is_high_end_android` reads
+            // for 64-bit CPUs only; `//components/cronet` imports them.
+            if matches!(target.gn_arg("target_cpu"), Some("arm64" | "x64")) {
+                args.push("is_high_end_android=true".into());
+            }
+        }
         _ => {}
     }
 
