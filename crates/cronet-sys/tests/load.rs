@@ -25,7 +25,7 @@ fn engine_starts_and_reports_its_version() {
         Cronet_EngineParams_Destroy(params);
 
         let version = CStr::from_ptr(Cronet_Engine_GetVersionString(engine)).to_str().unwrap();
-        assert!(version.starts_with("150."), "{version}");
+        assert_eq!(version, CHROMIUM_VERSION);
         assert!(!Cronet_Engine_GetStreamEngine(engine).is_null());
 
         assert_eq!(Cronet_Engine_Shutdown(engine), Cronet_RESULT_SUCCESS);
