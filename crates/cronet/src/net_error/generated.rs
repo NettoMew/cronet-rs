@@ -213,6 +213,10 @@ impl NetError {
     /// Some implementations of ProxyDelegate query a separate entity to know whether it should cancel tunnel prior to: - The HTTP CONNECT requests being sent out - The HTTP CONNECT response being parsed by //net An example is CronetProxyDelegate: Cronet allows developers to decide whether the tunnel being established should be canceled.
     pub const PROXY_DELEGATE_CANCELED_CONNECT_REQUEST: Self = Self(-187);
     pub const PROXY_DELEGATE_CANCELED_CONNECT_RESPONSE: Self = Self(-188);
+    /// The control message was too large for the transport. (for example a UDP message control data exceeds size threshold).
+    pub const CONTROL_MSG_TOO_BIG: Self = Self(-189);
+    /// Direct Sockets attempted to connect to or send a packet to a multicast address without 'direct-sockets-multicast' permissions policy.
+    pub const MULTICAST_NOT_ALLOWED: Self = Self(-190);
     /// The server responded with a certificate whose common name did not match the host name.  This could mean: 1. An attacker has redirected our traffic to their server and is presenting a certificate for which they know the private key. 2. The server is misconfigured and responding with the wrong cert. 3. The user is on a wireless network and is being redirected to the network's login page. 4. The OS has used a DNS search suffix and the server doesn't have a certificate for the abbreviated name in the address bar.
     pub const CERT_COMMON_NAME_INVALID: Self = Self(-200);
     /// The server responded with a certificate that, by our clock, appears to either not yet be valid or to have expired.  This could mean: 1. An attacker is presenting an old certificate for which they have managed to obtain the private key. 2. The server is misconfigured and is not presenting a valid cert. 3. Our clock is wrong.
@@ -479,6 +483,8 @@ impl NetError {
     pub const DNS_REFUSED: Self = Self(-819);
     /// The DNS server responded with an rcode indicating that the request failed, but the rcode is not one that we have a specific error code for. In other words, the rcode was not one of the following: - NOERR - FORMERR - SERVFAIL - NXDOMAIN - NOTIMP - REFUSED
     pub const DNS_OTHER_FAILURE: Self = Self(-820);
+    /// Declined to call DNS for a direct_only request of a hostname whose traffic would be routed through a proxy.
+    pub const DNS_DIRECT_ONLY: Self = Self(-821);
     /// The construction arguments are invalid. This is considered a bad IPC.
     pub const BLOB_INVALID_CONSTRUCTION_ARGUMENTS: Self = Self(-900);
     /// We don't have enough memory for the blob.
@@ -496,7 +502,7 @@ impl NetError {
 }
 
 /// Every known error, sorted by code for binary search.
-pub(super) static TABLE: [Entry; 245] = [
+pub(super) static TABLE: [Entry; 248] = [
     Entry {
         code: -906,
         name: "ERR_BLOB_REFERENCED_FILE_UNAVAILABLE",
@@ -531,6 +537,11 @@ pub(super) static TABLE: [Entry; 245] = [
         code: -900,
         name: "ERR_BLOB_INVALID_CONSTRUCTION_ARGUMENTS",
         description: "The construction arguments are invalid. This is considered a bad IPC.",
+    },
+    Entry {
+        code: -821,
+        name: "ERR_DNS_DIRECT_ONLY",
+        description: "Declined to call DNS for a direct_only request of a hostname whose traffic would be routed through a proxy.",
     },
     Entry {
         code: -820,
@@ -1196,6 +1207,16 @@ pub(super) static TABLE: [Entry; 245] = [
         code: -200,
         name: "ERR_CERT_COMMON_NAME_INVALID",
         description: "The server responded with a certificate whose common name did not match the host name.  This could mean: 1. An attacker has redirected our traffic to their server and is presenting a certificate for which they know the private key. 2. The server is misconfigured and responding with the wrong cert. 3. The user is on a wireless network and is being redirected to the network's login page. 4. The OS has used a DNS search suffix and the server doesn't have a certificate for the abbreviated name in the address bar.",
+    },
+    Entry {
+        code: -190,
+        name: "ERR_MULTICAST_NOT_ALLOWED",
+        description: "Direct Sockets attempted to connect to or send a packet to a multicast address without 'direct-sockets-multicast' permissions policy.",
+    },
+    Entry {
+        code: -189,
+        name: "ERR_CONTROL_MSG_TOO_BIG",
+        description: "The control message was too large for the transport. (for example a UDP message control data exceeds size threshold).",
     },
     Entry {
         code: -188,

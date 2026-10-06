@@ -2,4 +2,4 @@
 # version, bindings and network errors in this repository come from.
 # `cargo xtask upgrade` moves it; `cargo xtask fetch` checks it out.
 repository = "https://github.com/SagerNet/naiveproxy"
-commit = "72a06c9fca0e2d228588c7f3074bf7efff3ff686"
+commit = "be1be963131154ba82761a7ed85ba426b2027319"
