@@ -70,7 +70,10 @@ jobs:
           mkdir -p "$RUNNER_TEMP/libcronet"
           if gh release download --repo "$GITHUB_REPOSITORY" --pattern "libcronet-${{ matrix.triple }}.tar.xz" \
               --dir "$RUNNER_TEMP"; then
-            tar xJf "$RUNNER_TEMP/libcronet-${{ matrix.triple }}.tar.xz" -C "$RUNNER_TEMP/libcronet" --strip-components=1
+            # From inside the directory: GNU tar takes the `D:` of a
+            # Windows path for a remote host.
+            cd "$RUNNER_TEMP"
+            tar xJf "libcronet-${{ matrix.triple }}.tar.xz" -C libcronet --strip-components=1
             echo "dir=$RUNNER_TEMP/libcronet" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::No released libcronet for ${{ matrix.triple }} yet; runtime tests skipped."
