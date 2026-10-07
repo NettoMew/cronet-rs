@@ -4,14 +4,14 @@ members = ["crates/*", "xtask"]
 default-members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/NettoMew/cronet-rs"
 
 [workspace.dependencies]
-cronet-sys = { path = "crates/cronet-sys", version = "0.1.1" }
+cronet-sys = { path = "crates/cronet-sys", version = "0.1.2" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
