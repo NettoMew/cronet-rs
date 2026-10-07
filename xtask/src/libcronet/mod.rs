@@ -317,7 +317,16 @@ fn link_manifest(ninja: &str) -> String {
 pub(crate) fn env(workspace: &Workspace, target: &Target, export: bool) -> Result<()> {
     lock::fetch(workspace)?;
     let package = workspace.lib_root().join(target.triple);
-    let mut variables = vec![("CRONET_LIB_DIR".to_owned(), package.display().to_string())];
+    // The kind named, so that the library is linked even into a program
+    // whose dependencies ask `cronet` to open it at run time.
+    let kind = match target.output() {
+        Output::Dll => "dylib",
+        Output::StaticAndShared | Output::Static => "static",
+    };
+    let mut variables = vec![
+        ("CRONET_LIB_DIR".to_owned(), package.display().to_string()),
+        ("CRONET_LINK_KIND".to_owned(), kind.to_owned()),
+    ];
 
     let manifest = fs::read_to_string(package.join("cronet.link")).unwrap_or_default();
     let mut link_args: Vec<String> = manifest

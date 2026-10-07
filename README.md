@@ -20,7 +20,7 @@ cronet = { git = "https://github.com/NettoMew/cronet-rs", features = ["tokio", "
 
 | feature | adds |
 |---|---|
-| `dynamic` | Opens libcronet at run time instead of linking it. |
+| `dynamic` | Opens libcronet at run time instead of linking it, unless `CRONET_LINK_KIND` asks for it linked. |
 | `tokio` | `BidirectionalConn`: a stream as `tokio::io::AsyncRead + AsyncWrite`. |
 | `http` | `cronet::http::Client`: requests and responses as `http::Request` / `http::Response`, runtime-agnostic. |
 
@@ -91,6 +91,11 @@ Then either:
 - **load it** (feature `dynamic`): nothing is linked. The library is opened
   on first use from next to the executable or the system's library path, or
   explicitly with `cronet::load_library(path)`.
+
+  The program being built has the last word: with `CRONET_LINK_KIND` set (as
+  `cargo xtask env` sets it), the library is linked even where a dependency
+  turned on `dynamic`, and is open from the start. A static executable, which
+  can open nothing at run time, gets it that way.
 
 ## Building libcronet
 

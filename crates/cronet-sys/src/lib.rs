@@ -13,6 +13,11 @@
 //! Either way the functions below have the same names and signatures, so code
 //! written against them does not care which.
 //!
+//! The program being built has the last word: with `CRONET_LINK_KIND` set,
+//! the library is linked even when a dependency asked for `dynamic`, and
+//! [`load`] finds it open from the start. That is how a static executable,
+//! which can open nothing at run time, gets it.
+//!
 //! [naiveproxy]: https://github.com/klzgrad/naiveproxy
 
 #![allow(
@@ -25,7 +30,7 @@
 
 /// Declares the C functions. Generated bindings invoke this once with every
 /// function; what it expands to depends on how the library is reached.
-#[cfg(not(feature = "dynamic"))]
+#[cfg(linked)]
 macro_rules! cronet_api {
     ($( $(#[$meta:meta])* pub fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)?; )*) => {
         unsafe extern "C" {
@@ -34,7 +39,7 @@ macro_rules! cronet_api {
     };
 }
 
-#[cfg(feature = "dynamic")]
+#[cfg(not(linked))]
 macro_rules! cronet_api {
     ($( $(#[$meta:meta])* pub fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)?; )*) => {
         /// Every entry point, resolved once when the library is loaded.

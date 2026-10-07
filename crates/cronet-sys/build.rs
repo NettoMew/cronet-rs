@@ -6,17 +6,23 @@
 //!   needs), `libcronet.so` / `libcronet.dylib`, or on Windows `cronet.dll` and
 //!   its import library `cronet.dll.lib`.
 //! - `CRONET_LINK_KIND`: `static` or `dylib`, when the directory holds both.
+//!   Set, it also links the library when `dynamic` would open it: the program
+//!   being built decides, whatever its dependencies asked of `cronet`. A
+//!   static executable, a musl one say, can open nothing at run time.
 //!
 //! Without `CRONET_LIB_DIR`, `cronet` is linked from the linker's own path.
+//! The crate is built with `cfg(linked)` whenever the library is linked.
 
 use std::{env, fs, path::PathBuf};
 
 fn main() {
     println!("cargo::rerun-if-env-changed=CRONET_LIB_DIR");
     println!("cargo::rerun-if-env-changed=CRONET_LINK_KIND");
-    if env::var_os("CARGO_FEATURE_DYNAMIC").is_some() {
+    println!("cargo::rustc-check-cfg=cfg(linked)");
+    if env::var_os("CARGO_FEATURE_DYNAMIC").is_some() && env::var_os("CRONET_LINK_KIND").is_none() {
         return;
     }
+    println!("cargo::rustc-cfg=linked");
 
     let Some(directory) = env::var_os("CRONET_LIB_DIR").map(PathBuf::from) else {
         println!("cargo::rustc-link-lib=dylib=cronet");

@@ -5,7 +5,9 @@
 //! success or failure, is what every later call sees.
 //!
 //! When linked instead, only [`LoadError`] and [`ensure_loaded`] remain, so
-//! that code built either way can check for the library the same way.
+//! that code built either way can check for the library the same way; or,
+//! linked although `dynamic` is on, the library is open from the start, and
+//! the calls that would open it say so.
 
 use std::{error, fmt, path::PathBuf};
 
@@ -16,7 +18,7 @@ pub struct LoadError {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(not(feature = "dynamic"), allow(dead_code))]
+#[cfg_attr(linked, allow(dead_code))]
 enum Kind {
     /// Nothing by any of the names opened; why, for each attempt.
     NotFound(Vec<String>),
@@ -46,18 +48,42 @@ impl error::Error for LoadError {}
 /// library always is; a loaded one is opened from the default locations if
 /// nothing has opened it yet.
 pub fn ensure_loaded() -> Result<(), LoadError> {
-    #[cfg(feature = "dynamic")]
+    #[cfg(not(linked))]
     return dynamic::load_default();
-    #[cfg(not(feature = "dynamic"))]
+    #[cfg(linked)]
     Ok(())
 }
 
-#[cfg(feature = "dynamic")]
+#[cfg(not(linked))]
 pub(crate) use dynamic::{Library, api};
-#[cfg(feature = "dynamic")]
+#[cfg(not(linked))]
 pub use dynamic::{is_loaded, load, load_default};
+#[cfg(all(feature = "dynamic", linked))]
+pub use linked::{is_loaded, load, load_default};
 
-#[cfg(feature = "dynamic")]
+/// `dynamic`'s calls, for a library linked all the same: it was open before
+/// any of them, so they all find it open, and `load` ignores its path as it
+/// does once a library is.
+#[cfg(all(feature = "dynamic", linked))]
+mod linked {
+    use std::path::PathBuf;
+
+    use super::LoadError;
+
+    pub fn load(_path: impl Into<PathBuf>) -> Result<(), LoadError> {
+        Ok(())
+    }
+
+    pub fn load_default() -> Result<(), LoadError> {
+        Ok(())
+    }
+
+    pub fn is_loaded() -> bool {
+        true
+    }
+}
+
+#[cfg(not(linked))]
 mod dynamic {
     use std::{
         env,

@@ -9,11 +9,12 @@ use std::{
     thread,
 };
 
-/// Whether libcronet is available. Linked, it always is; loaded at run time,
-/// it is when `CRONET_LIBRARY` names it, and the test is skipped otherwise.
+/// Whether libcronet is available. Linked, it always is, `dynamic` or not;
+/// loaded at run time, it is when `CRONET_LIBRARY` names it, and the test is
+/// skipped otherwise.
 pub(crate) fn library() -> bool {
     #[cfg(feature = "dynamic")]
-    {
+    if !cronet::sys::is_loaded() {
         let Some(path) = std::env::var_os("CRONET_LIBRARY") else {
             eprintln!("CRONET_LIBRARY is not set; skipping");
             return false;
