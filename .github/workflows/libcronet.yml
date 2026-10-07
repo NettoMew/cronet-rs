@@ -83,6 +83,14 @@ jobs:
         env:
           CRONET_LIBRARY: ${{ github.workspace }}/lib/${{ matrix.triple }}/libcronet.so
         run: cargo test --workspace --all-features
+      # The same tests with the static library linked into a static musl
+      # executable, as `cargo xtask env` links it: even with `dynamic` on.
+      - name: Test against the build, linked statically
+        if: matrix.triple == 'x86_64-unknown-linux-musl'
+        run: |
+          rustup target add ${{ matrix.triple }}
+          eval "$(cargo xtask env --target ${{ matrix.triple }} --export)"
+          cargo test -p cronet --target ${{ matrix.triple }} --all-features
       - name: Pack
         run: tar cJf libcronet-${{ matrix.triple }}.tar.xz -C lib ${{ matrix.triple }}
       - uses: actions/upload-artifact@v7

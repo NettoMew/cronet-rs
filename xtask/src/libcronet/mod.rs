@@ -245,10 +245,12 @@ pub(crate) fn package(workspace: &Workspace, targets: &[&Target]) -> Result<()> 
                 copy(&out.join("cronet.dll.lib"), &package.join("cronet.dll.lib"))?;
             }
             output => {
-                copy(
-                    &out.join("obj/components/cronet/libcronet_static.a"),
-                    &package.join("libcronet.a"),
-                )?;
+                let archive = out.join("obj/components/cronet/libcronet_static.a");
+                if target.elf() {
+                    prelink(workspace, &archive, &out, &package.join("libcronet.a"))?;
+                } else {
+                    copy(&archive, &package.join("libcronet.a"))?;
+                }
                 if output == Output::StaticAndShared {
                     copy(&out.join("libcronet.so"), &package.join("libcronet.so"))?;
                 }
@@ -263,6 +265,103 @@ pub(crate) fn package(workspace: &Workspace, targets: &[&Target]) -> Result<()> 
         eprintln!("[xtask] packaged {}", package.display());
     }
     Ok(())
+}
+
+/// The C library's allocation functions, as Chromium's allocator shim
+/// replaces them in a program that links it statically
+/// (`allocator_shim_override_libc_symbols.h`, and for glibc
+/// `allocator_shim_override_glibc_weak_symbols.h`).
+const SHIM: [&str; 21] = [
+    "aligned_alloc",
+    "calloc",
+    "cfree",
+    "free",
+    "malloc",
+    "malloc_size",
+    "malloc_usable_size",
+    "memalign",
+    "posix_memalign",
+    "pvalloc",
+    "realloc",
+    "valloc",
+    "__libc_calloc",
+    "__libc_cfree",
+    "__libc_free",
+    "__libc_malloc",
+    "__libc_memalign",
+    "__libc_pvalloc",
+    "__libc_realloc",
+    "__libc_valloc",
+    "__posix_memalign",
+];
+
+/// What of a static libcronet stays global once it is prelinked: Cronet's C
+/// API, and what Chromium means the whole program to use, its allocator
+/// shim's replacements of the C library's allocation functions and their
+/// `__wrap_` forms, which the `-wrap` flags in Android's `cronet.link` name.
+fn stays_global(symbol: &str) -> bool {
+    symbol.starts_with("Cronet_")
+        || symbol.starts_with("bidirectional_stream_")
+        || symbol.starts_with("__wrap_")
+        || SHIM.contains(&symbol)
+}
+
+/// The symbols in `nm`'s list that stay global, each once, in order.
+fn globals(nm: &str) -> Vec<&str> {
+    let mut globals: Vec<&str> = nm
+        .lines()
+        .map(str::trim)
+        .filter(|symbol| stays_global(symbol))
+        .collect();
+    globals.sort_unstable();
+    globals.dedup();
+    globals
+}
+
+/// `libcronet_static.a` made as self-contained as `libcronet.so`: the
+/// members a program would take from it, linked into one object, with every
+/// symbol made local but those that [stay global](stays_global). Its
+/// BoringSSL, its libc++ and the rest of Chromium then meet no other copy of
+/// theirs in the program (another BoringSSL, say), and what the API never
+/// reaches, such as code calling into parts of Chromium the build leaves
+/// out, never comes in. Nor are COMDAT groups left in it: a linker keeps one
+/// group of each name in a program, and could keep another object's in place
+/// of one whose code the object, its symbols now local, still calls.
+/// `scratch` holds what is made on the way.
+///
+/// Chromium's own `lld` and LLVM tools do it: they read the CREL relocations
+/// its clang writes for most Linux CPUs, as whatever links the result must.
+fn prelink(workspace: &Workspace, archive: &Path, scratch: &Path, to: &Path) -> Result<()> {
+    let tool = |name: &str| {
+        workspace
+            .src_root()
+            .join("third_party/llvm-build/Release+Asserts/bin")
+            .join(name)
+    };
+    let defined = output(
+        Command::new(tool("llvm-nm"))
+            .args(["--defined-only", "--extern-only", "--format=just-symbols", "--quiet"])
+            .arg(archive),
+    )?;
+    let globals = globals(&defined);
+    if !globals.iter().any(|symbol| symbol.starts_with("Cronet_")) {
+        bail!("{} defines none of Cronet's C API", archive.display());
+    }
+    let object = scratch.join("libcronet_prelinked.o");
+    let list = scratch.join("libcronet_globals.txt");
+    fs::write(&list, globals.join("\n") + "\n")?;
+    // As a program linking the archive would take its members: those that
+    // define what it asks for, and what they need in turn.
+    run(Command::new(tool("ld.lld"))
+        .args(["-r", "--force-group-allocation"])
+        .args(globals.iter().flat_map(|symbol| ["-u", symbol]))
+        .arg(archive)
+        .arg("-o")
+        .arg(&object))?;
+    run(Command::new(tool("llvm-objcopy"))
+        .arg(format!("--keep-global-symbols={}", list.display()))
+        .arg(&object))?;
+    run(Command::new(tool("llvm-ar")).arg("rcsD").arg(to).arg(&object))
 }
 
 fn copy(from: &Path, to: &Path) -> Result<()> {
@@ -401,6 +500,36 @@ frameworks = -framework Foundation -framework Security
         assert_eq!(
             link_manifest(ninja),
             "arg=-Wl,-wrap,malloc\nlib=dl\nlib=pthread\narg=-l:libunwind.a\nframework=Foundation\nframework=Security\n"
+        );
+    }
+
+    #[test]
+    fn what_stays_global() {
+        // As `llvm-nm --format=just-symbols` lists an archive: a blank line
+        // and a header before each member's symbols.
+        let nm = [
+            "",
+            "libcronet_static.a(cronet_c.o):",
+            "Cronet_Engine_Create",
+            "bidirectional_stream_create",
+            "SSL_new",
+            "_ZNSt4__Cr12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev",
+            "_Znwm",
+            "malloc",
+            "__libc_malloc",
+            "__wrap_strdup",
+            "Cronet_Engine_Create",
+        ]
+        .join("\n");
+        assert_eq!(
+            globals(&nm),
+            [
+                "Cronet_Engine_Create",
+                "__libc_malloc",
+                "__wrap_strdup",
+                "bidirectional_stream_create",
+                "malloc",
+            ]
         );
     }
 

@@ -197,6 +197,11 @@ impl Target {
             .find_map(|argument| argument.strip_prefix(prefix.as_str())?.strip_suffix('"'))
     }
 
+    /// Whether its objects are ELF: Linux's, OpenWrt's and Android's.
+    pub(crate) fn elf(&self) -> bool {
+        matches!(self.gn_arg("target_os"), Some("linux" | "openwrt" | "android"))
+    }
+
     /// What its build produces: Chromium's `cronet` shared library exists for
     /// Windows and Linux only, and a static musl build cannot make one.
     pub(crate) fn output(&self) -> Output {
@@ -280,6 +285,19 @@ mod tests {
             Some("simulator")
         );
         assert!(Target::find("sparc-sun-solaris").is_err());
+    }
+
+    #[test]
+    fn elf() {
+        for (triple, elf) in [
+            ("x86_64-unknown-linux-gnu", true),
+            ("aarch64-unknown-linux-musl", true),
+            ("aarch64-linux-android", true),
+            ("aarch64-apple-darwin", false),
+            ("x86_64-pc-windows-msvc", false),
+        ] {
+            assert_eq!(Target::find(triple).unwrap().elf(), elf, "{triple}");
+        }
     }
 
     #[test]

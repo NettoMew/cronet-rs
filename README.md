@@ -88,6 +88,13 @@ Then either:
   Chromium's clang and `lld`: `cargo xtask env --target <triple>` prints the
   settings. Without `CRONET_LIB_DIR`, `cronet` is linked from the linker's
   own path.
+
+  On Linux and Android, `libcronet.a` is one prelinked object that keeps
+  Chromium to itself, as `libcronet.so` does: only Cronet's C API is global
+  in it (and, where Chromium's allocator is built in, the allocation
+  functions it replaces), so its BoringSSL and libc++ link beside any other
+  copy of theirs, such as `boring`'s or `openssl`'s.
+
 - **load it** (feature `dynamic`): nothing is linked. The library is opened
   on first use from next to the executable or the system's library path, or
   explicitly with `cronet::load_library(path)`.
