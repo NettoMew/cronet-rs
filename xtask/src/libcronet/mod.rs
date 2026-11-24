@@ -248,6 +248,8 @@ pub(crate) fn package(workspace: &Workspace, targets: &[&Target]) -> Result<()> 
                 let archive = out.join("obj/components/cronet/libcronet_static.a");
                 if target.elf() {
                     prelink(workspace, &archive, &out, &package.join("libcronet.a"))?;
+                } else if target.apple() {
+                    prelink_apple(target, &archive, &out, &package.join("libcronet.a"))?;
                 } else {
                     copy(&archive, &package.join("libcronet.a"))?;
                 }
@@ -256,7 +258,13 @@ pub(crate) fn package(workspace: &Workspace, targets: &[&Target]) -> Result<()> 
                 }
                 let ninja = fs::read_to_string(out.join("obj/components/cronet/cronet_sample.ninja"))
                     .context("reading the link line of cronet_sample")?;
-                fs::write(package.join("cronet.link"), link_manifest(&ninja))?;
+                let mut manifest = link_manifest(&ninja);
+                if target.apple() && !manifest.lines().any(|line| line == "lib=c++abi") {
+                    // `prelink_apple` drops bundled `cxa_personality.o` so
+                    // `___gxx_personality_v0` resolves to system `libc++abi`.
+                    manifest.push_str("lib=c++abi\n");
+                }
+                fs::write(package.join("cronet.link"), manifest)?;
             }
         }
         fs::write(package.join("VERSION"), version.trim())?;
@@ -362,6 +370,156 @@ fn prelink(workspace: &Workspace, archive: &Path, scratch: &Path, to: &Path) -> 
         .arg(format!("--keep-global-symbols={}", list.display()))
         .arg(&object))?;
     run(Command::new(tool("llvm-ar")).arg("rcsD").arg(to).arg(&object))
+}
+
+/// What of a Mach-O static libcronet stays global once prelinked: Cronet's C
+/// API (`_Cronet_*` and `_bidirectional_stream_*`), with the leading Mach-O C
+/// symbol underscore intact.
+fn stays_global_apple(symbol: &str) -> bool {
+    let Some(name) = symbol.strip_prefix('_') else {
+        return false;
+    };
+    name.starts_with("Cronet_") || name.starts_with("bidirectional_stream_")
+}
+
+fn globals_apple(nm: &str) -> Vec<&str> {
+    let mut globals: Vec<&str> = nm
+        .lines()
+        .map(str::trim)
+        .filter(|symbol| stays_global_apple(symbol))
+        .collect();
+    globals.sort_unstable();
+    globals.dedup();
+    globals
+}
+
+/// Parses `otool -l`'s `LC_BUILD_VERSION` block into `(platform, minos, sdk)`
+/// for `ld -platform_version`.
+fn apple_build_version(otool: &str) -> Result<(&'static str, String, String)> {
+    let mut in_block = false;
+    let mut platform: Option<&'static str> = None;
+    let mut minos: Option<String> = None;
+    let mut sdk: Option<String> = None;
+    for line in otool.lines().map(str::trim) {
+        if let Some(cmd) = line.strip_prefix("cmd ") {
+            if in_block {
+                break;
+            }
+            in_block = cmd.trim() == "LC_BUILD_VERSION";
+            continue;
+        }
+        if !in_block {
+            continue;
+        }
+        if let Some(raw) = line.strip_prefix("platform ") {
+            platform = Some(match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "macos" => "macos",
+                "2" | "ios" => "ios",
+                "3" | "tvos" => "tvos",
+                "7" | "iossimulator" | "ios-simulator" => "ios-simulator",
+                "8" | "tvossimulator" | "tvos-simulator" => "tvos-simulator",
+                other => bail!("unsupported Mach-O platform `{other}` in LC_BUILD_VERSION"),
+            });
+        } else if let Some(raw) = line.strip_prefix("minos ") {
+            minos = Some(raw.trim().to_owned());
+        } else if let Some(raw) = line.strip_prefix("sdk ") {
+            let trimmed = raw.trim();
+            sdk = Some(if trimmed.is_empty() || trimmed == "n/a" || trimmed == "0.0" {
+                String::new()
+            } else {
+                trimmed.to_owned()
+            });
+        }
+    }
+    let platform = platform.context("no LC_BUILD_VERSION platform in Mach-O object")?;
+    let minos = minos.context("no LC_BUILD_VERSION minos in Mach-O object")?;
+    let sdk = sdk.filter(|s| !s.is_empty()).unwrap_or_else(|| minos.clone());
+    Ok((platform, minos, sdk))
+}
+
+/// Prelinks a Mach-O `libcronet_static.a` into a single relocatable object via
+/// Apple's `ld -r -exported_symbols_list` so Chromium's internal BoringSSL,
+/// libc++ and support symbols become private and never collide with another
+/// BoringSSL or C++ library linked into the same binary.
+fn prelink_apple(target: &Target, archive: &Path, scratch: &Path, to: &Path) -> Result<()> {
+    let arch = match target.gn_arg("target_cpu") {
+        Some("arm64") => "arm64",
+        Some("x64") => "x86_64",
+        other => bail!("unsupported Apple target_cpu {other:?} for {target}"),
+    };
+    let defined = output(Command::new("xcrun").args(["nm", "-gU", "-j"]).arg(archive))?;
+    let globals = globals_apple(&defined);
+    if !globals.iter().any(|symbol| symbol.starts_with("_Cronet_")) {
+        bail!("{} defines none of Cronet's C API", archive.display());
+    }
+
+    let input = scratch.join("libcronet_input.a");
+    copy(archive, &input)?;
+    let members = output(Command::new("xcrun").args(["ar", "-t"]).arg(&input))?;
+    // Chromium's static archive bundles libc++abi's `cxa_personality.o`
+    // (`___gxx_personality_v0`). Localizing it with `ld -r` would create a
+    // private personality routine alongside the system `libc++abi.dylib`'s
+    // `___gxx_personality_v0`, `base::apple::CxxPersonalityRoutine`, and a host
+    // language's personality (such as `_rust_eh_personality`), exceeding
+    // Mach-O's 3-slot compact unwind table limit. Dropping `cxa_personality.o`
+    // lets `___gxx_personality_v0` resolve to `libSystem` as normal.
+    if members.lines().any(|line| line.trim() == "cxa_personality.o") {
+        run(Command::new("xcrun")
+            .args(["ar", "d"])
+            .arg(&input)
+            .arg("cxa_personality.o"))?;
+    }
+
+    let first_member = members
+        .lines()
+        .map(str::trim)
+        .find(|name| name.ends_with(".o") && *name != "cxa_personality.o")
+        .context("no object member found in Mach-O archive")?;
+    let probe_bytes = Command::new("xcrun")
+        .args(["ar", "-p"])
+        .arg(&input)
+        .arg(first_member)
+        .output()
+        .context("extracting Mach-O probe object")?;
+    if !probe_bytes.status.success() {
+        bail!("`xcrun ar -p` failed on {}", input.display());
+    }
+    let probe = scratch.join("libcronet_probe.o");
+    fs::write(&probe, &probe_bytes.stdout)?;
+    let headers = output(Command::new("xcrun").args(["otool", "-l"]).arg(&probe))?;
+    let _ = fs::remove_file(&probe);
+    let (platform, minos, sdk) = apple_build_version(&headers)?;
+
+    let object = scratch.join("libcronet_prelinked.o");
+    let list = scratch.join("libcronet_globals.txt");
+    fs::write(&list, globals.join("\n") + "\n")?;
+    let link_res = run(Command::new("xcrun")
+        .args([
+            "ld",
+            "-r",
+            "-arch",
+            arch,
+            "-platform_version",
+            platform,
+            &minos,
+            &sdk,
+            "-exported_symbols_list",
+        ])
+        .arg(&list)
+        .args(globals.iter().flat_map(|symbol| ["-u", *symbol]))
+        .arg(&input)
+        .arg("-o")
+        .arg(&object));
+    let _ = fs::remove_file(&input);
+    link_res?;
+
+    let _ = fs::remove_file(to);
+    let ar_res = run(Command::new("xcrun")
+        .args(["libtool", "-static", "-D", "-o"])
+        .arg(to)
+        .arg(&object));
+    let _ = fs::remove_file(&object);
+    ar_res
 }
 
 fn copy(from: &Path, to: &Path) -> Result<()> {
@@ -538,5 +696,115 @@ frameworks = -framework Foundation -framework Security
         assert_eq!(shell_quote("/opt/lib-dir"), "/opt/lib-dir");
         assert_eq!(shell_quote("clang --target=x"), "'clang --target=x'");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn apple_globals_and_build_version() {
+        let nm = [
+            "",
+            "libcronet_static.a(cronet_c.o):",
+            "_Cronet_Engine_Create",
+            "_bidirectional_stream_create",
+            "_SSL_new",
+            "_malloc",
+            "___gxx_personality_v0",
+            "_Cronet_Engine_Create",
+        ]
+        .join("\n");
+        assert_eq!(
+            globals_apple(&nm),
+            ["_Cronet_Engine_Create", "_bidirectional_stream_create"]
+        );
+
+        let macos_otool = "\
+Load command 1
+      cmd LC_BUILD_VERSION
+  cmdsize 24
+ platform 1
+    minos 13.0
+      sdk 27.0
+   ntools 0
+Load command 2
+      cmd LC_SYMTAB
+";
+        assert_eq!(
+            apple_build_version(macos_otool).unwrap(),
+            ("macos", "13.0".to_owned(), "27.0".to_owned())
+        );
+
+        let sim_otool = "\
+Load command 0
+      cmd LC_BUILD_VERSION
+  cmdsize 24
+ platform 7
+    minos 15.0
+      sdk n/a
+";
+        assert_eq!(
+            apple_build_version(sim_otool).unwrap(),
+            ("ios-simulator", "15.0".to_owned(), "15.0".to_owned())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prelink_apple_hides_internal_symbols_and_drops_cxa_personality() {
+        let dir = std::env::temp_dir().join(format!("xtask-prelink-apple-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let target = Target::host().unwrap();
+        let clang_arch = match target.gn_arg("target_cpu") {
+            Some("arm64") => "arm64",
+            Some("x64") => "x86_64",
+            other => panic!("unexpected host cpu: {other:?}"),
+        };
+
+        fs::write(
+            dir.join("api.c"),
+            "int SSL_new(void);\nint Cronet_Test_Entry(void) { return SSL_new() + 1; }\n",
+        )
+        .unwrap();
+        fs::write(dir.join("ssl.c"), "int SSL_new(void) { return 41; }\n").unwrap();
+        fs::write(
+            dir.join("cxa_personality.c"),
+            "int __gxx_personality_v0(void) { return 0; }\n",
+        )
+        .unwrap();
+
+        for (src, obj) in [
+            ("api.c", "api.o"),
+            ("ssl.c", "ssl.o"),
+            ("cxa_personality.c", "cxa_personality.o"),
+        ] {
+            run(Command::new("xcrun")
+                .args(["clang", "-c", "-arch", clang_arch])
+                .arg(dir.join(src))
+                .arg("-o")
+                .arg(dir.join(obj)))
+            .unwrap();
+        }
+
+        let raw = dir.join("libcronet_static.a");
+        run(Command::new("xcrun")
+            .args(["ar", "rcs"])
+            .arg(&raw)
+            .arg(dir.join("api.o"))
+            .arg(dir.join("ssl.o"))
+            .arg(dir.join("cxa_personality.o")))
+        .unwrap();
+
+        let out = dir.join("libcronet.a");
+        prelink_apple(target, &raw, &dir, &out).unwrap();
+
+        let exported = output(Command::new("xcrun").args(["nm", "-gU", "-j"]).arg(&out)).unwrap();
+        let syms: Vec<&str> = exported
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.ends_with(':'))
+            .collect();
+        assert_eq!(syms, ["_Cronet_Test_Entry"]);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

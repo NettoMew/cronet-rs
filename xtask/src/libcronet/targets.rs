@@ -202,6 +202,11 @@ impl Target {
         matches!(self.gn_arg("target_os"), Some("linux" | "openwrt" | "android"))
     }
 
+    /// Whether its objects are Mach-O: macOS's, iOS's and tvOS's.
+    pub(crate) fn apple(&self) -> bool {
+        matches!(self.gn_arg("target_os"), Some("mac" | "ios"))
+    }
+
     /// What its build produces: Chromium's `cronet` shared library exists for
     /// Windows and Linux only, and a static musl build cannot make one.
     pub(crate) fn output(&self) -> Output {
@@ -289,14 +294,17 @@ mod tests {
 
     #[test]
     fn elf() {
-        for (triple, elf) in [
-            ("x86_64-unknown-linux-gnu", true),
-            ("aarch64-unknown-linux-musl", true),
-            ("aarch64-linux-android", true),
-            ("aarch64-apple-darwin", false),
-            ("x86_64-pc-windows-msvc", false),
+        for (triple, elf, apple) in [
+            ("x86_64-unknown-linux-gnu", true, false),
+            ("aarch64-unknown-linux-musl", true, false),
+            ("aarch64-linux-android", true, false),
+            ("aarch64-apple-darwin", false, true),
+            ("aarch64-apple-ios-sim", false, true),
+            ("x86_64-pc-windows-msvc", false, false),
         ] {
-            assert_eq!(Target::find(triple).unwrap().elf(), elf, "{triple}");
+            let target = Target::find(triple).unwrap();
+            assert_eq!(target.elf(), elf, "{triple}");
+            assert_eq!(target.apple(), apple, "{triple}");
         }
     }
 
