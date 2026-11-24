@@ -437,6 +437,34 @@ fn apple_build_version(otool: &str) -> Result<(&'static str, String, String)> {
     Ok((platform, minos, sdk))
 }
 
+/// Mach-O 64-bit little-endian header constants (`<mach-o/loader.h>`).
+const MH_MAGIC_64: u32 = 0xfeed_facf;
+const MH_OBJECT: u32 = 0x1;
+const MH_SUBSECTIONS_VIA_SYMBOLS: u32 = 0x2000;
+
+/// Sets `MH_SUBSECTIONS_VIA_SYMBOLS` on a 64-bit Mach-O `MH_OBJECT` header, or
+/// verifies whether it is already set.
+fn macho_has_subsections_via_symbols(bytes: &[u8]) -> Result<bool> {
+    if bytes.len() < 32 {
+        bail!("Mach-O object header truncated ({} bytes)", bytes.len());
+    }
+    let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let filetype = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    if magic != MH_MAGIC_64 || filetype != MH_OBJECT {
+        bail!("unexpected Mach-O header (magic=0x{magic:08x}, filetype={filetype})");
+    }
+    let flags = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+    Ok((flags & MH_SUBSECTIONS_VIA_SYMBOLS) != 0)
+}
+
+fn enable_macho_subsections_via_symbols(bytes: &mut [u8]) -> Result<()> {
+    if !macho_has_subsections_via_symbols(bytes)? {
+        let flags = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+        bytes[24..28].copy_from_slice(&(flags | MH_SUBSECTIONS_VIA_SYMBOLS).to_le_bytes());
+    }
+    Ok(())
+}
+
 /// Prelinks a Mach-O `libcronet_static.a` into a single relocatable object via
 /// Apple's `ld -r -exported_symbols_list` so Chromium's internal BoringSSL,
 /// libc++ and support symbols become private and never collide with another
@@ -468,6 +496,32 @@ fn prelink_apple(target: &Target, archive: &Path, scratch: &Path, to: &Path) -> 
             .args(["ar", "d"])
             .arg(&input)
             .arg("cxa_personality.o"))?;
+    }
+    // `base/apple/call_with_eh_frame_asm.S` is a single-function hand-written
+    // assembly stub that omits `.subsections_via_symbols`. Even one input
+    // object without `MH_SUBSECTIONS_VIA_SYMBOLS` causes `ld -r` to clear that
+    // flag on the entire merged relocatable object, preventing `-dead_strip`
+    // in downstream builds from stripping unreachable code.
+    if members.lines().any(|line| line.trim() == "call_with_eh_frame_asm.o") {
+        let asm_out = Command::new("xcrun")
+            .args(["ar", "-p"])
+            .arg(&input)
+            .arg("call_with_eh_frame_asm.o")
+            .output()
+            .context("extracting call_with_eh_frame_asm.o")?;
+        if !asm_out.status.success() {
+            bail!("`xcrun ar -p call_with_eh_frame_asm.o` failed on {}", input.display());
+        }
+        let mut asm_bytes = asm_out.stdout;
+        enable_macho_subsections_via_symbols(&mut asm_bytes)?;
+        let asm_obj = scratch.join("call_with_eh_frame_asm.o");
+        fs::write(&asm_obj, &asm_bytes)?;
+        let rep_res = run(Command::new("xcrun")
+            .args(["ar", "r"])
+            .arg(&input)
+            .arg(&asm_obj));
+        let _ = fs::remove_file(&asm_obj);
+        rep_res?;
     }
 
     let first_member = members
@@ -512,6 +566,15 @@ fn prelink_apple(target: &Target, archive: &Path, scratch: &Path, to: &Path) -> 
         .arg(&object));
     let _ = fs::remove_file(&input);
     link_res?;
+
+    let prelinked_hdr = fs::read(&object).with_context(|| format!("reading {}", object.display()))?;
+    if !macho_has_subsections_via_symbols(&prelinked_hdr)? {
+        let _ = fs::remove_file(&object);
+        bail!(
+            "{} lost MH_SUBSECTIONS_VIA_SYMBOLS during `ld -r`; downstream -dead_strip would break",
+            object.display()
+        );
+    }
 
     let _ = fs::remove_file(to);
     let ar_res = run(Command::new("xcrun")
@@ -762,20 +825,31 @@ Load command 0
 
         fs::write(
             dir.join("api.c"),
-            "int SSL_new(void);\nint Cronet_Test_Entry(void) { return SSL_new() + 1; }\n",
+            "int SSL_new(void);\nint asm_helper(void);\nint Cronet_Test_Entry(void) { return SSL_new() + asm_helper(); }\n",
         )
         .unwrap();
-        fs::write(dir.join("ssl.c"), "int SSL_new(void) { return 41; }\n").unwrap();
+        fs::write(
+            dir.join("ssl.c"),
+            "extern int UnusedExternal(void);\nint SSL_new(void) { return 41; }\nint DeadUnreachable(void) { return UnusedExternal(); }\n",
+        )
+        .unwrap();
         fs::write(
             dir.join("cxa_personality.c"),
             "int __gxx_personality_v0(void) { return 0; }\n",
         )
         .unwrap();
+        // Assembly object deliberately omitting `.subsections_via_symbols`.
+        let asm_src = match clang_arch {
+            "arm64" => ".text\n.globl _asm_helper\n_asm_helper:\n  mov w0, #1\n  ret\n",
+            _ => ".text\n.globl _asm_helper\n_asm_helper:\n  movl $1, %eax\n  retq\n",
+        };
+        fs::write(dir.join("call_with_eh_frame_asm.s"), asm_src).unwrap();
 
         for (src, obj) in [
             ("api.c", "api.o"),
             ("ssl.c", "ssl.o"),
             ("cxa_personality.c", "cxa_personality.o"),
+            ("call_with_eh_frame_asm.s", "call_with_eh_frame_asm.o"),
         ] {
             run(Command::new("xcrun")
                 .args(["clang", "-c", "-arch", clang_arch])
@@ -784,6 +858,10 @@ Load command 0
                 .arg(dir.join(obj)))
             .unwrap();
         }
+        assert!(
+            !macho_has_subsections_via_symbols(&fs::read(dir.join("call_with_eh_frame_asm.o")).unwrap()).unwrap(),
+            "test fixture must exercise missing MH_SUBSECTIONS_VIA_SYMBOLS"
+        );
 
         let raw = dir.join("libcronet_static.a");
         run(Command::new("xcrun")
@@ -791,7 +869,8 @@ Load command 0
             .arg(&raw)
             .arg(dir.join("api.o"))
             .arg(dir.join("ssl.o"))
-            .arg(dir.join("cxa_personality.o")))
+            .arg(dir.join("cxa_personality.o"))
+            .arg(dir.join("call_with_eh_frame_asm.o")))
         .unwrap();
 
         let out = dir.join("libcronet.a");
@@ -804,6 +883,25 @@ Load command 0
             .filter(|line| !line.is_empty() && !line.ends_with(':'))
             .collect();
         assert_eq!(syms, ["_Cronet_Test_Entry"]);
+
+        // Downstream `-dead_strip` must strip `DeadUnreachable` (and its
+        // unresolved `_UnusedExternal` reference) thanks to preserved
+        // `MH_SUBSECTIONS_VIA_SYMBOLS`.
+        fs::write(
+            dir.join("host.c"),
+            "int Cronet_Test_Entry(void);\n__attribute__((visibility(\"default\"))) int host_entry(void) { return Cronet_Test_Entry(); }\n",
+        )
+        .unwrap();
+        let dylib = dir.join("libhost.dylib");
+        run(Command::new("xcrun")
+            .args(["clang", "-dynamiclib", "-arch", clang_arch, "-Wl,-dead_strip"])
+            .arg(dir.join("host.c"))
+            .arg(&out)
+            .arg("-o")
+            .arg(&dylib))
+        .unwrap();
+        let undefs = output(Command::new("xcrun").args(["nm", "-u", "-j"]).arg(&dylib)).unwrap();
+        assert!(!undefs.lines().any(|l| l.trim() == "_UnusedExternal"));
 
         let _ = fs::remove_dir_all(&dir);
     }
