@@ -68,8 +68,9 @@ impl Lock {
 }
 
 /// Checks the locked commit out into `naiveproxy/`, fetching only that
-/// commit. Already there, it does nothing, and so keeps whatever the build
-/// left in the tree.
+/// commit, and applies any local patches in `patches/`. Already at the same
+/// commit and patch set, it does nothing, keeping whatever the build left in
+/// the tree.
 pub(crate) fn fetch(workspace: &Workspace) -> Result<()> {
     let lock = Lock::read(workspace)?;
     let root = workspace.naive_root();
@@ -83,16 +84,16 @@ pub(crate) fn fetch(workspace: &Workspace) -> Result<()> {
         run(git().args(["init", "--quiet"]))?;
     }
     let head = output(git().args(["rev-parse", "--verify", "--quiet", "HEAD"])).unwrap_or_default();
-    if head.trim() == lock.commit {
-        return Ok(());
+    if head.trim() != lock.commit {
+        eprintln!(
+            "[xtask] fetching naiveproxy {} from {}",
+            &lock.commit[..12],
+            lock.repository
+        );
+        run(git().args(["fetch", "--quiet", "--depth", "1", &lock.repository, &lock.commit]))?;
+        run(git().args(["checkout", "--quiet", "--detach", &lock.commit]))?;
     }
-    eprintln!(
-        "[xtask] fetching naiveproxy {} from {}",
-        &lock.commit[..12],
-        lock.repository
-    );
-    run(git().args(["fetch", "--quiet", "--depth", "1", &lock.repository, &lock.commit]))?;
-    run(git().args(["checkout", "--quiet", "--detach", &lock.commit]))
+    crate::patches::apply(workspace, &lock.commit)
 }
 
 #[cfg(test)]

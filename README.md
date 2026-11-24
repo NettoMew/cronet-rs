@@ -68,8 +68,12 @@ used from any thread.
 ## Getting libcronet
 
 Each [release](https://github.com/NettoMew/cronet-rs/releases) carries
-`libcronet-<triple>.tar.xz` for every target below: the library, `cronet.link`
-(what a static link also needs), `VERSION`, and Chromium's `LICENSE`.
+`libcronet-<triple>.tar.xz`: the library, `cronet.link` (what a static link
+also needs), `VERSION`, and Chromium's `LICENSE`. Releases publish the default
+targets (`x86_64`/`aarch64` Linux glibc and musl, `x86_64` Windows,
+`x86_64`/`aarch64` macOS, `aarch64` iOS and simulator, and
+`aarch64`/`x86_64`/`armv7` Android); `xtask` and the `libcronet` workflow
+(`targets: all`) support the full table below.
 
 | | targets |
 |---|---|
@@ -115,13 +119,16 @@ eval "$(cargo xtask env --target x86_64-unknown-linux-gnu --export)"
 The build first checks out the naiveproxy commit `naiveproxy.lock` names
 into `naiveproxy/` (`cargo xtask fetch`, shallow, ignored by git; a large
 part of Chromium, so nothing that merely depends on these crates downloads
-it). It then runs naiveproxy's own `get-clang.sh`, which fetches Chromium's
+it), then applies any `patches/*.patch` in lexical order and overlays
+`patches/src/` onto `naiveproxy/src/` (stopping at once on a conflict and
+naming the naiveproxy commit). It then runs naiveproxy's own `get-clang.sh`, which fetches Chromium's
 clang, GN, PGO profiles, and the Debian, OpenWrt or Android sysroot the target
 needs, then builds Cronet's `cronet_static` (and `cronet`, where Chromium
 offers it) with naiveproxy's release configuration. Hosts are those
 naiveproxy builds on: Linux for Linux, OpenWrt and Android; Windows for
 Windows; macOS for Apple platforms. The [`libcronet`](.github/workflows/libcronet.yml)
-workflow builds them all.
+workflow builds the standard release targets by default, or any subset (or
+`all`) passed in its `targets` input.
 
 `cargo xtask bindgen` regenerates `cronet-sys` from its headers, and
 `cargo xtask net-errors` regenerates `cronet::NetError` from Chromium's

@@ -1,8 +1,9 @@
-# Builds libcronet for every supported target from the naiveproxy commit
-# naiveproxy.lock names, laid out the way naiveproxy's own CI builds its
-# releases. Each package is an artifact `libcronet-<triple>`; on a release
-# published by hand, it is also attached to it. `release.yml` calls this for
-# the releases it makes.
+# Builds libcronet from the naiveproxy commit naiveproxy.lock names, laid out
+# the way naiveproxy's own CI builds its releases. By default it builds the
+# standard release targets; pass `targets: all` for every supported target, or
+# a comma- or space-separated list of triples to build only those. Each package
+# is an artifact `libcronet-<triple>`; on a release published by hand, it is
+# also attached to it. `release.yml` calls this for the releases it makes.
 
 name: libcronet
 
@@ -13,7 +14,20 @@ on:
         description: The commit to build.
         type: string
         required: true
+      targets:
+        description: Target triples to build (comma/space-separated, `default`, or `all`).
+        type: string
+        default: ""
   workflow_dispatch:
+    inputs:
+      ref:
+        description: The commit or ref to build (defaults to the triggered ref).
+        type: string
+        default: ""
+      targets:
+        description: Target triples to build (comma/space-separated, `default`, or `all`).
+        type: string
+        default: ""
   release:
     types: [published]
 
@@ -25,36 +39,117 @@ env:
   CACHE_EPOCH: 1
 
 jobs:
+  targets:
+    runs-on: ubuntu-24.04
+    outputs:
+      ref: ${{ steps.resolve.outputs.ref }}
+      linux: ${{ steps.resolve.outputs.linux }}
+      windows: ${{ steps.resolve.outputs.windows }}
+      apple: ${{ steps.resolve.outputs.apple }}
+      has_linux: ${{ steps.resolve.outputs.has_linux }}
+      has_windows: ${{ steps.resolve.outputs.has_windows }}
+      has_apple: ${{ steps.resolve.outputs.has_apple }}
+    steps:
+      - id: resolve
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_TARGETS: ${{ inputs.targets }}
+          FALLBACK_REF: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys
+
+          all_linux = [
+              "x86_64-unknown-linux-gnu",
+              "i686-unknown-linux-gnu",
+              "aarch64-unknown-linux-gnu",
+              "armv7-unknown-linux-gnueabihf",
+              "riscv64gc-unknown-linux-gnu",
+              "loongarch64-unknown-linux-gnu",
+              "mipsel-unknown-linux-gnu",
+              "mips64el-unknown-linux-gnuabi64",
+              "x86_64-unknown-linux-musl",
+              "i686-unknown-linux-musl",
+              "aarch64-unknown-linux-musl",
+              "armv7-unknown-linux-musleabihf",
+              "mipsel-unknown-linux-musl",
+              "riscv64gc-unknown-linux-musl",
+              "loongarch64-unknown-linux-musl",
+              "aarch64-linux-android",
+              "x86_64-linux-android",
+              "armv7-linux-androideabi",
+              "i686-linux-android",
+          ]
+          all_windows = [
+              "x86_64-pc-windows-msvc",
+              "i686-pc-windows-msvc",
+              "aarch64-pc-windows-msvc",
+          ]
+          all_apple = [
+              "aarch64-apple-darwin",
+              "x86_64-apple-darwin",
+              "aarch64-apple-ios",
+              "aarch64-apple-ios-sim",
+              "x86_64-apple-ios",
+              "aarch64-apple-tvos",
+              "aarch64-apple-tvos-sim",
+              "x86_64-apple-tvos",
+          ]
+          default_targets = [
+              "x86_64-unknown-linux-gnu",
+              "aarch64-unknown-linux-gnu",
+              "x86_64-unknown-linux-musl",
+              "aarch64-unknown-linux-musl",
+              "aarch64-linux-android",
+              "x86_64-linux-android",
+              "armv7-linux-androideabi",
+              "x86_64-pc-windows-msvc",
+              "aarch64-apple-darwin",
+              "x86_64-apple-darwin",
+              "aarch64-apple-ios",
+              "aarch64-apple-ios-sim",
+          ]
+          known = set(all_linux + all_windows + all_apple)
+          raw = os.environ.get("INPUT_TARGETS", "").strip()
+          if not raw or raw == "default":
+              selected = set(default_targets)
+          elif raw == "all":
+              selected = set(known)
+          else:
+              tokens = [t for t in re.split(r"[\s,]+", raw) if t]
+              unknown = [t for t in tokens if t not in known]
+              if unknown:
+                  sys.exit(f"unknown target triple(s): {', '.join(unknown)}")
+              selected = set(tokens)
+
+          linux = [t for t in all_linux if t in selected]
+          windows = [t for t in all_windows if t in selected]
+          apple = [t for t in all_apple if t in selected]
+          ref = os.environ.get("INPUT_REF", "").strip() or os.environ["FALLBACK_REF"]
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"ref={ref}\n")
+              out.write(f"linux={json.dumps(linux)}\n")
+              out.write(f"windows={json.dumps(windows)}\n")
+              out.write(f"apple={json.dumps(apple)}\n")
+              out.write(f"has_linux={'true' if linux else 'false'}\n")
+              out.write(f"has_windows={'true' if windows else 'false'}\n")
+              out.write(f"has_apple={'true' if apple else 'false'}\n")
+          PY
+
   linux:
+    needs: targets
+    if: needs.targets.outputs.has_linux == 'true'
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        triple:
-          - x86_64-unknown-linux-gnu
-          - i686-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
-          - armv7-unknown-linux-gnueabihf
-          - riscv64gc-unknown-linux-gnu
-          - loongarch64-unknown-linux-gnu
-          - mipsel-unknown-linux-gnu
-          - mips64el-unknown-linux-gnuabi64
-          - x86_64-unknown-linux-musl
-          - i686-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-          - armv7-unknown-linux-musleabihf
-          - mipsel-unknown-linux-musl
-          - riscv64gc-unknown-linux-musl
-          - loongarch64-unknown-linux-musl
-          - aarch64-linux-android
-          - x86_64-linux-android
-          - armv7-linux-androideabi
-          - i686-linux-android
+        triple: ${{ fromJson(needs.targets.outputs.linux) }}
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.ref }}
-      # The locked naiveproxy, before its caches are restored into it.
+          ref: ${{ needs.targets.outputs.ref }}
+      # The locked naiveproxy (with any local patches), before its caches are restored into it.
       - run: cargo xtask fetch
       - uses: actions/cache@v6
         with:
@@ -103,19 +198,21 @@ jobs:
         run: gh release upload "${{ github.event.release.tag_name }}" libcronet-${{ matrix.triple }}.tar.xz --clobber
 
   windows:
+    needs: targets
+    if: needs.targets.outputs.has_windows == 'true'
     runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:
-        triple: [x86_64-pc-windows-msvc, i686-pc-windows-msvc, aarch64-pc-windows-msvc]
+        triple: ${{ fromJson(needs.targets.outputs.windows) }}
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.ref }}
-      # The locked naiveproxy, before its caches are restored into it.
+          ref: ${{ needs.targets.outputs.ref }}
+      # The locked naiveproxy (with any local patches), before its caches are restored into it.
       - run: cargo xtask fetch
       - uses: actions/cache@v6
         with:
@@ -152,24 +249,18 @@ jobs:
         run: gh release upload "${{ github.event.release.tag_name }}" libcronet-${{ matrix.triple }}.tar.xz --clobber
 
   apple:
+    needs: targets
+    if: needs.targets.outputs.has_apple == 'true'
     runs-on: macos-26
     strategy:
       fail-fast: false
       matrix:
-        triple:
-          - aarch64-apple-darwin
-          - x86_64-apple-darwin
-          - aarch64-apple-ios
-          - aarch64-apple-ios-sim
-          - x86_64-apple-ios
-          - aarch64-apple-tvos
-          - aarch64-apple-tvos-sim
-          - x86_64-apple-tvos
+        triple: ${{ fromJson(needs.targets.outputs.apple) }}
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.ref }}
-      # The locked naiveproxy, before its caches are restored into it.
+          ref: ${{ needs.targets.outputs.ref }}
+      # The locked naiveproxy (with any local patches), before its caches are restored into it.
       - run: cargo xtask fetch
       - uses: actions/cache@v6
         with:
@@ -187,6 +278,11 @@ jobs:
       - run: pip install setuptools
       - run: cargo xtask build --target ${{ matrix.triple }}
       - run: cargo xtask package --target ${{ matrix.triple }}
+      - name: Test against the build, linked statically
+        if: matrix.triple == 'aarch64-apple-darwin'
+        run: |
+          eval "$(cargo xtask env --target ${{ matrix.triple }} --export)"
+          cargo test -p cronet --all-features
       - name: Pack
         run: tar cJf libcronet-${{ matrix.triple }}.tar.xz -C lib ${{ matrix.triple }}
       - uses: actions/upload-artifact@v7

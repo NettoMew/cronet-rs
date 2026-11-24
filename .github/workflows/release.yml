@@ -135,7 +135,7 @@ jobs:
           NAIVEPROXY: ${{ needs.plan.outputs.naiveproxy }}
         run: |
           cat > notes.md <<EOF
-          libcronet from naiveproxy [\`${NAIVEPROXY:0:12}\`](https://github.com/SagerNet/naiveproxy/commit/$NAIVEPROXY), Chromium $CHROMIUM, for every supported target.
+          libcronet from naiveproxy [\`${NAIVEPROXY:0:12}\`](https://github.com/SagerNet/naiveproxy/commit/$NAIVEPROXY), Chromium $CHROMIUM.
 
           Each \`libcronet-<triple>.tar.xz\` holds the library, \`cronet.link\` (what a static link also needs), \`VERSION\`, and Chromium's \`LICENSE\`. See the README for linking or loading it.
           EOF

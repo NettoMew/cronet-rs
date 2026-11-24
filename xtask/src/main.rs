@@ -10,6 +10,7 @@ mod bindgen;
 mod libcronet;
 mod lock;
 mod net_errors;
+mod patches;
 mod upgrade;
 
 use std::{
@@ -131,6 +132,11 @@ impl Workspace {
 
     pub(crate) fn sys_include(&self) -> PathBuf {
         self.root.join("crates/cronet-sys/include")
+    }
+
+    /// Local Chromium patches (`patches/*.patch`) and overlays (`patches/src/`).
+    pub(crate) fn patches_root(&self) -> PathBuf {
+        self.root.join("patches")
     }
 }
 

@@ -18,7 +18,11 @@ use std::{env, fs, io::Write as _, path::Path, process::Command, sync::LazyLock}
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 
-use crate::{Workspace, bindgen, libcronet, lock::Lock, net_errors, output};
+use crate::{
+    Workspace, bindgen, libcronet,
+    lock::{self, Lock},
+    net_errors, output, patches,
+};
 
 /// The project whose naiveproxy pin is followed by default.
 const REFERENCE: &str = "SagerNet/cronet-go";
@@ -69,24 +73,46 @@ pub(crate) fn run(workspace: &Workspace, source: Source) -> Result<()> {
 
     let bindings = workspace.root().join("crates/cronet-sys/src/bindings.rs");
     let before = fs::read_to_string(&bindings)?;
-    for header in libcronet::HEADERS {
-        let name = Path::new(header).file_name().expect("headers are files");
-        fs::write(workspace.sys_include().join(name), fetch(&format!("src/{header}"))?)?;
+    if patches::has_entries(workspace)? {
+        // Verify local patches still apply cleanly to the new commit, and read
+        // headers from the patched tree rather than raw unpatched files.
+        let previous = lock.clone();
+        lock.commit.clone_from(&target);
+        lock.write(workspace)?;
+        if let Err(error) = lock::fetch(workspace) {
+            let _ = previous.write(workspace);
+            return Err(error);
+        }
+        for header in libcronet::HEADERS {
+            let name = Path::new(header).file_name().expect("headers are files");
+            fs::copy(workspace.src_root().join(header), workspace.sys_include().join(name))?;
+        }
+        fs::write(
+            workspace.sys_include().join("CHROMIUM_VERSION"),
+            format!("{chromium}\n"),
+        )?;
+        bindgen::run(workspace)?;
+        net_errors::run(workspace, None)?;
+    } else {
+        for header in libcronet::HEADERS {
+            let name = Path::new(header).file_name().expect("headers are files");
+            fs::write(workspace.sys_include().join(name), fetch(&format!("src/{header}"))?)?;
+        }
+        fs::write(
+            workspace.sys_include().join("CHROMIUM_VERSION"),
+            format!("{chromium}\n"),
+        )?;
+        bindgen::run(workspace)?;
+
+        let scratch = workspace.root().join("target/xtask");
+        fs::create_dir_all(&scratch)?;
+        let net_error_list = scratch.join("net_error_list.h");
+        fs::write(&net_error_list, fetch("src/net/base/net_error_list.h")?)?;
+        net_errors::run(workspace, Some(net_error_list))?;
+
+        lock.commit.clone_from(&target);
+        lock.write(workspace)?;
     }
-    fs::write(
-        workspace.sys_include().join("CHROMIUM_VERSION"),
-        format!("{chromium}\n"),
-    )?;
-    bindgen::run(workspace)?;
-
-    let scratch = workspace.root().join("target/xtask");
-    fs::create_dir_all(&scratch)?;
-    let net_error_list = scratch.join("net_error_list.h");
-    fs::write(&net_error_list, fetch("src/net/base/net_error_list.h")?)?;
-    net_errors::run(workspace, Some(net_error_list))?;
-
-    lock.commit.clone_from(&target);
-    lock.write(workspace)?;
 
     // A changed C API may change what the crates offer: a breaking version.
     // Otherwise only the library moved: a patch.

@@ -132,8 +132,10 @@ impl CType {
             "double" => "f64",
             "size_t" => "usize",
             "intptr_t" => "isize",
+            "int8_t" => "i8",
             "int32_t" => "i32",
             "int64_t" => "i64",
+            "uint8_t" => "u8",
             "uint16_t" => "u16",
             "uint32_t" => "u32",
             "uint64_t" => "u64",
@@ -555,7 +557,9 @@ mod tests {
 
     #[test]
     fn pointers_and_const() {
-        let parsed = items("GRPC_SUPPORT_EXPORT int f(const bidirectional_stream_header_array* headers, char* out);");
+        let parsed = items(
+            "GRPC_SUPPORT_EXPORT int f(const bidirectional_stream_header_array* headers, const uint8_t* bytes, int8_t* tag, char* out);",
+        );
         let [
             Item {
                 kind: Kind::Function(_, signature),
@@ -567,7 +571,12 @@ mod tests {
         };
         assert_eq!(
             parameters(signature),
-            ["headers: *const bidirectional_stream_header_array", "out: *mut c_char"]
+            [
+                "headers: *const bidirectional_stream_header_array",
+                "bytes: *const u8",
+                "tag: *mut i8",
+                "out: *mut c_char",
+            ]
         );
         assert_eq!(signature.returns.rust(), "c_int");
     }
