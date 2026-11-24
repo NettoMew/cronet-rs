@@ -370,49 +370,51 @@ mod tokio_tls {
             _client: client.clone(),
         });
 
-        // Cronet's reference, released in `on_closed`.
-        let cronet_ref = Arc::into_raw(shared.clone());
-        let (ech_ptr, ech_len) = match ech {
-            Some(bytes) if !bytes.is_empty() => (bytes.as_ptr(), bytes.len()),
-            _ => (ptr::null(), 0),
-        };
-        let mut lower_handle: *mut sys::Cronet_LowerStreamHandle = ptr::null_mut();
-        // SAFETY: `client` is live; `host_c` and `ech` live for the call;
-        // `cronet_ref` stays valid until `on_closed`.
-        let conn_ptr = unsafe {
-            sys::Cronet_TlsConn_Create(
-                client.0.raw.as_ptr(),
-                host_c.as_ptr(),
-                port,
-                ech_ptr,
-                ech_len,
-                &CALLBACKS,
-                cronet_ref.cast_mut().cast::<c_void>(),
-                &mut lower_handle,
-            )
-        };
-        let Some(raw) = NonNull::new(conn_ptr) else {
-            // SAFETY: `Cronet_TlsConn_Create` failed, so `on_closed` will never run.
-            unsafe { drop(Arc::from_raw(cronet_ref)) };
-            if !lower_handle.is_null() {
-                // SAFETY: freeing the unused handle.
-                unsafe { sys::Cronet_LowerStreamHandle_Destroy(lower_handle) };
+        let guard = {
+            // Cronet's reference, released in `on_closed`.
+            let cronet_ref = Arc::into_raw(shared.clone());
+            let (ech_ptr, ech_len) = match ech {
+                Some(bytes) if !bytes.is_empty() => (bytes.as_ptr(), bytes.len()),
+                _ => (ptr::null(), 0),
+            };
+            let mut lower_handle: *mut sys::Cronet_LowerStreamHandle = ptr::null_mut();
+            // SAFETY: `client` is live; `host_c` and `ech` live for the call;
+            // `cronet_ref` stays valid until `on_closed`.
+            let conn_ptr = unsafe {
+                sys::Cronet_TlsConn_Create(
+                    client.0.raw.as_ptr(),
+                    host_c.as_ptr(),
+                    port,
+                    ech_ptr,
+                    ech_len,
+                    &CALLBACKS,
+                    cronet_ref.cast_mut().cast::<c_void>(),
+                    &mut lower_handle,
+                )
+            };
+            let Some(raw) = NonNull::new(conn_ptr) else {
+                // SAFETY: `Cronet_TlsConn_Create` failed, so `on_closed` will never run.
+                unsafe { drop(Arc::from_raw(cronet_ref)) };
+                if !lower_handle.is_null() {
+                    // SAFETY: freeing the unused handle.
+                    unsafe { sys::Cronet_LowerStreamHandle_Destroy(lower_handle) };
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Cronet_TlsConn_Create returned null",
+                ));
+            };
+
+            // SAFETY: `lower_handle` was created specifically for this stream.
+            let raw_lower = unsafe { into_raw_stream(lower, lower_handle, runtime) };
+            // SAFETY: `raw` is live, and `Cronet_TlsConn_Start` copies `raw_lower`
+            // and takes ownership of closing it.
+            unsafe { sys::Cronet_TlsConn_Start(raw.as_ptr(), &raw_lower) };
+
+            ConnDropGuard {
+                raw: Some(raw),
+                shared: shared.clone(),
             }
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Cronet_TlsConn_Create returned null",
-            ));
-        };
-
-        // SAFETY: `lower_handle` was created specifically for this stream.
-        let raw_lower = unsafe { into_raw_stream(lower, lower_handle, runtime) };
-        // SAFETY: `raw` is live, and `Cronet_TlsConn_Start` copies `raw_lower`
-        // and takes ownership of closing it.
-        unsafe { sys::Cronet_TlsConn_Start(raw.as_ptr(), &raw_lower) };
-
-        let guard = ConnDropGuard {
-            raw: Some(raw),
-            shared: shared.clone(),
         };
 
         let outcome = future::poll_fn(|cx| {
@@ -446,6 +448,10 @@ mod tokio_tls {
         raw: Option<NonNull<sys::Cronet_TlsConn>>,
         shared: Arc<Shared>,
     }
+
+    // SAFETY: `Cronet_TlsConn_Destroy` posts destruction onto the engine's
+    // network thread, and `Shared` is `Send + Sync`.
+    unsafe impl Send for ConnDropGuard {}
 
     impl Drop for ConnDropGuard {
         fn drop(&mut self) {

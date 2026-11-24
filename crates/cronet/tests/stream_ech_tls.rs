@@ -716,7 +716,11 @@ async fn tls_client_echoes_megabytes_and_verifies_roots_names_pins_and_mtls() {
     let acceptor = TlsAcceptor::from(Arc::new(pki.server_config));
     let (client_io, server_io) = tokio::io::duplex(4096);
     serve_tls_echo(server_io, acceptor.clone());
-    let tls_stream = client.connect("cert.example", client_io).await.unwrap();
+    let client_for_spawn = client.clone();
+    let tls_stream = tokio::spawn(async move { client_for_spawn.connect("cert.example", client_io).await })
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(tls_stream.alpn(), Some("h2"));
     assert!(!tls_stream.ech_accepted());
 
