@@ -1,0 +1,290 @@
+diff --git a/src/components/cronet/native/BUILD.gn b/src/components/cronet/native/BUILD.gn
+index 1cac9ec9..425d92d0 100644
+--- a/src/components/cronet/native/BUILD.gn
++++ b/src/components/cronet/native/BUILD.gn
+@@ -51,6 +51,8 @@ source_set("cronet_native_impl") {
+ 
+   sources = [
+     "buffer.cc",
++    "endpoint_resolver.cc",
++    "endpoint_resolver.h",
+     "engine.cc",
+     "engine.h",
+     "stream_dialer.cc",
+diff --git a/src/components/cronet/native/engine.cc b/src/components/cronet/native/engine.cc
+index b1ef4171..b2932c79 100644
+--- a/src/components/cronet/native/engine.cc
++++ b/src/components/cronet/native/engine.cc
+@@ -4,6 +4,9 @@
+ 
+ #include "components/cronet/native/engine.h"
+ 
++#include "base/compiler_specific.h"
++#include "components/cronet/native/endpoint_resolver.h"
++
+ #include <optional>
+ #include <unordered_set>
+ #include <utility>
+@@ -313,11 +316,20 @@ Cronet_RESULT Cronet_EngineImpl::StartWithParams(
+     dialer_context_ = nullptr;
+   }
+   if (stream_dialer_) {
++    // Enable synthetic in-memory resolution automatically when a stream
++    // dialer is used so Chromium never queries OS DNS for dialer hosts.
++    if (!endpoint_registry_) {
++      endpoint_registry_ = base::MakeRefCounted<EndpointRegistry>();
++    }
++    endpoint_registry_->SetEnabled(true);
+     config->stream_dialer = stream_dialer_;
+     config->stream_dialer_context = stream_dialer_context_;
+     stream_dialer_ = nullptr;
+     stream_dialer_context_ = nullptr;
+   }
++  if (endpoint_registry_) {
++    config->endpoint_registry = endpoint_registry_;
++  }
+ 
+   // Set custom UDP dialer if provided.
+   if (udp_dialer_) {
+@@ -569,6 +581,41 @@ void Cronet_EngineImpl::SetUdpDialer(intptr_t (*dialer)(void*,
+   udp_socket_close_ = on_close;
+ }
+ 
++void Cronet_EngineImpl::SetEndpoint(const char* host,
++                                    const uint8_t* ech_config_list,
++                                    size_t ech_config_list_len,
++                                    const char* alpns_comma_separated,
++                                    bool strict_ech) {
++  scoped_refptr<EndpointRegistry> reg;
++  {
++    base::AutoLock lock(lock_);
++    if (!endpoint_registry_) {
++      endpoint_registry_ = base::MakeRefCounted<EndpointRegistry>();
++    }
++    reg = endpoint_registry_;
++  }
++  std::vector<uint8_t> ech;
++  if (ech_config_list && ech_config_list_len > 0) {
++    ech.assign(ech_config_list,
++               UNSAFE_TODO(ech_config_list + ech_config_list_len));
++  }
++  reg->SetEndpoint(host ? std::string(host) : std::string(), std::move(ech),
++                   SplitCommaSeparatedAlpns(alpns_comma_separated),
++                   strict_ech);
++}
++
++void Cronet_EngineImpl::ClearEndpoints() {
++  scoped_refptr<EndpointRegistry> reg;
++  {
++    base::AutoLock lock(lock_);
++    if (!endpoint_registry_) {
++      endpoint_registry_ = base::MakeRefCounted<EndpointRegistry>();
++    }
++    reg = endpoint_registry_;
++  }
++  reg->ClearEndpoints();
++}
++
+ void Cronet_EngineImpl::CloseAllConnections() {
+   base::WaitableEvent done;
+   {  // Keep `context_` alive until the close task has been queued.
+@@ -620,6 +667,22 @@ CRONET_EXPORT void Cronet_Engine_CloseAllConnections(
+   static_cast<cronet::Cronet_EngineImpl*>(engine)->CloseAllConnections();
+ }
+ 
++CRONET_EXPORT void Cronet_Engine_SetEndpoint(
++    Cronet_EnginePtr engine,
++    const char* host,
++    const uint8_t* ech_config_list,
++    size_t ech_config_list_len,
++    const char* alpns_comma_separated,
++    bool strict_ech) {
++  static_cast<cronet::Cronet_EngineImpl*>(engine)->SetEndpoint(
++      host, ech_config_list, ech_config_list_len, alpns_comma_separated,
++      strict_ech);
++}
++
++CRONET_EXPORT void Cronet_Engine_ClearEndpoints(Cronet_EnginePtr engine) {
++  static_cast<cronet::Cronet_EngineImpl*>(engine)->ClearEndpoints();
++}
++
+ CRONET_EXPORT void Cronet_Engine_SetDialer(Cronet_EnginePtr engine,
+                                            Cronet_DialerFunc dialer,
+                                            void* context) {
+diff --git a/src/components/cronet/native/engine.h b/src/components/cronet/native/engine.h
+index 228728ff..a0b97c13 100644
+--- a/src/components/cronet/native/engine.h
++++ b/src/components/cronet/native/engine.h
+@@ -28,6 +28,7 @@ class CertVerifier;
+ 
+ namespace cronet {
+ class CronetContext;
++class EndpointRegistry;
+ 
+ // Implementation of Cronet_Engine that uses CronetContext.
+ class Cronet_EngineImpl : public Cronet_Engine {
+@@ -90,6 +91,13 @@ class Cronet_EngineImpl : public Cronet_Engine {
+   // Close all connections managed by the engine's network session.
+   void CloseAllConnections();
+ 
++  void SetEndpoint(const char* host,
++                   const uint8_t* ech_config_list,
++                   size_t ech_config_list_len,
++                   const char* alpns_comma_separated,
++                   bool strict_ech);
++  void ClearEndpoints();
++
+   // Get stream engine for GRPC Bidirectional Stream support. The returned
+   // stream_engine is owned by |this| and is only valid until |this| shutdown.
+   stream_engine* GetBidirectionalStreamEngine();
+@@ -148,6 +156,8 @@ class Cronet_EngineImpl : public Cronet_Engine {
+                         struct Cronet_LowerStream*) = nullptr;
+   void* stream_dialer_context_ = nullptr;
+ 
++  scoped_refptr<EndpointRegistry> endpoint_registry_;
++
+   // Custom dialer for UDP sockets. Only valid until StartWithParams.
+   intptr_t (*udp_dialer_)(void*,
+                           const char*,
+diff --git a/src/components/cronet/native/include/cronet_c.h b/src/components/cronet/native/include/cronet_c.h
+index c7815d74..71e0e8e5 100644
+--- a/src/components/cronet/native/include/cronet_c.h
++++ b/src/components/cronet/native/include/cronet_c.h
+@@ -171,6 +171,23 @@ CRONET_EXPORT void Cronet_LowerStreamHandle_Destroy(
+ CRONET_EXPORT uint64_t Cronet_BidirectionalStream_GetConnectionId(
+     bidirectional_stream* stream);
+ 
++// Registers or updates synthetic endpoint metadata (ECHConfigList, comma-
++// separated ALPNs such as "h2" or "h3,h2", and strict ECH enforcement) for
++// `host` on `engine`. May be called both before and after StartWithParams().
++// Enabling any endpoint installs an in-memory HostResolver that never queries
++// system or network DNS.
++CRONET_EXPORT void Cronet_Engine_SetEndpoint(
++    Cronet_EnginePtr engine,
++    const char* host,
++    const uint8_t* ech_config_list,
++    size_t ech_config_list_len,
++    const char* alpns_comma_separated,
++    bool strict_ech);
++
++// Clears all registered endpoint metadata entries on `engine` while enabling
++// (or keeping active) the in-memory endpoint resolver.
++CRONET_EXPORT void Cronet_Engine_ClearEndpoints(Cronet_EnginePtr engine);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/components/cronet/url_request_context_config.cc b/src/components/cronet/url_request_context_config.cc
+index 3561fa83..d1532959 100644
+--- a/src/components/cronet/url_request_context_config.cc
++++ b/src/components/cronet/url_request_context_config.cc
+@@ -42,6 +42,7 @@
+ #include "net/nqe/network_quality_estimator_params.h"
+ #include "net/quic/set_quic_flag.h"
+ #include "net/socket/client_socket_pool_manager.h"
++#include "components/cronet/native/endpoint_resolver.h"
+ #include "components/cronet/native/stream_dialer.h"
+ #include "net/socket/custom_client_socket_factory.h"
+ #include "net/socket/ssl_client_socket.h"
+@@ -1137,19 +1138,40 @@ void URLRequestContextConfig::ConfigureURLRequestContextBuilder(
+     // When a custom stream dialer is set, wrap the socket factory so TCP
+     // streams use Cronet_LowerStream while UDP datagram sockets continue
+     // delegating to CustomClientSocketFactory.
++    HostLookupCallback host_lookup;
++    if (endpoint_registry) {
++      host_lookup = base::BindRepeating(&EndpointRegistry::LookupHostByIp,
++                                        endpoint_registry);
++    }
+     if (stream_dialer) {
+       factory = std::make_unique<StreamClientSocketFactory>(
+-          stream_dialer, stream_dialer_context, HostLookupCallback(),
++          stream_dialer, stream_dialer_context, std::move(host_lookup),
+           std::move(factory));
+     }
+     context_builder->set_client_socket_factory(std::move(factory));
+   } else if (stream_dialer &&
+              bound_network == net::handles::kInvalidNetworkHandle) {
++    HostLookupCallback host_lookup;
++    if (endpoint_registry) {
++      host_lookup = base::BindRepeating(&EndpointRegistry::LookupHostByIp,
++                                        endpoint_registry);
++    }
+     context_builder->set_client_socket_factory(
+         std::make_unique<StreamClientSocketFactory>(
+-            stream_dialer, stream_dialer_context, HostLookupCallback(),
++            stream_dialer, stream_dialer_context, std::move(host_lookup),
+             nullptr));
+   }
++  // Install the in-memory endpoint HostResolver (when enabled) and the
++  // Chrome Trust-Anchor-ID + strict-ECH SSLConfigService.
++  if (bound_network == net::handles::kInvalidNetworkHandle) {
++    if (endpoint_registry && endpoint_registry->IsEnabled()) {
++      context_builder->set_host_resolver(
++          std::make_unique<EndpointHostResolver>(endpoint_registry));
++    }
++    context_builder->set_ssl_config_service(
++        std::make_unique<EndpointSSLConfigService>(endpoint_registry,
++                                                   false));
++  }
+   // TODO(mef): Use |config| to set cookies.
+ }
+ 
+diff --git a/src/components/cronet/url_request_context_config.h b/src/components/cronet/url_request_context_config.h
+index ef7b0d11..af3d6314 100644
+--- a/src/components/cronet/url_request_context_config.h
++++ b/src/components/cronet/url_request_context_config.h
+@@ -34,6 +34,7 @@ class URLRequestContextBuilder;
+ }  // namespace net
+ 
+ namespace cronet {
++class EndpointRegistry;
+ 
+ // Common configuration parameters used by Cronet to configure
+ // URLRequestContext.
+@@ -202,6 +203,8 @@ struct URLRequestContextConfig {
+                        struct Cronet_LowerStream*) = nullptr;
+   void* stream_dialer_context = nullptr;
+ 
++  scoped_refptr<EndpointRegistry> endpoint_registry;
++
+   // Custom UDP dialer callback. When set, this callback will be used to
+   // create UDP sockets instead of the default socket API.
+   // The callback takes (context, address, port, out_local_address,
+diff --git a/src/net/socket/ssl_connect_job.cc b/src/net/socket/ssl_connect_job.cc
+index 3776d69f..1fc0fbd2 100644
+--- a/src/net/socket/ssl_connect_job.cc
++++ b/src/net/socket/ssl_connect_job.cc
+@@ -503,7 +503,13 @@ int SSLConnectJob::DoSSLConnectComplete(int result) {
+   const bool ech_enabled =
+       IsEchEnabled(ssl_client_context(), params_->host_and_port());
+ 
+-  if (!ech_retry_configs_ && result == ERR_ECH_NOT_NEGOTIATED && ech_enabled) {
++  // Under EchMode::kStrict, ECH rejection must fail immediately without
++  // retrying using server-supplied retry_configs.
++  const bool ech_allow_retry =
++      ssl_client_context()->GetEchMode(params_->host_and_port().host()) ==
++      EchMode::kOpportunistic;
++  if (!ech_retry_configs_ && result == ERR_ECH_NOT_NEGOTIATED &&
++      ech_allow_retry) {
+     // We used ECH, and the server could not decrypt the ClientHello. However,
+     // it was able to handshake with the public name and send authenticated
+     // retry configs. If this is not the first time around, retry the connection
+diff --git a/src/net/socket/tls_stream_attempt.cc b/src/net/socket/tls_stream_attempt.cc
+index 5641bd74..cc4cb85a 100644
+--- a/src/net/socket/tls_stream_attempt.cc
++++ b/src/net/socket/tls_stream_attempt.cc
+@@ -278,7 +278,13 @@ int TlsStreamAttempt::DoTlsAttemptComplete(int rv) {
+   const bool ech_enabled =
+       IsEchEnabled(params().ssl_client_context, host_port_pair_.host());
+ 
+-  if (!ech_retry_configs_ && rv == ERR_ECH_NOT_NEGOTIATED && ech_enabled) {
++  // Under EchMode::kStrict, ECH rejection must fail immediately without
++  // retrying using server-supplied retry_configs.
++  const bool ech_allow_retry =
++      params().ssl_client_context->GetEchMode(host_port_pair_.host()) ==
++      EchMode::kOpportunistic;
++  if (!ech_retry_configs_ && rv == ERR_ECH_NOT_NEGOTIATED &&
++      ech_allow_retry) {
+     CHECK(ssl_socket_);
+     // We used ECH, and the server could not decrypt the ClientHello. However,
+     // it was able to handshake with the public name and send authenticated

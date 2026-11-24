@@ -1,0 +1,391 @@
+diff --git a/src/components/cronet/cronet_context.cc b/src/components/cronet/cronet_context.cc
+index e8a73dbb..06ce7418 100644
+--- a/src/components/cronet/cronet_context.cc
++++ b/src/components/cronet/cronet_context.cc
+@@ -36,6 +36,7 @@
+ #include "build/build_config.h"
+ #include "components/cronet/cronet_global_state.h"
+ #include "components/cronet/cronet_prefs_manager.h"
++#include "components/cronet/native/tls_client.h"
+ #include "components/cronet/host_cache_persistence_manager.h"
+ #include "components/cronet/url_request_context_config.h"
+ #include "net/base/completion_once_callback.h"
+@@ -508,6 +509,21 @@ void CronetContext::NetworkTasks::SetSharedURLRequestContextConfig(
+       ->SetEnablePublicKeyPinningBypassForLocalTrustAnchors(
+           context_config_->bypass_public_key_pinning_for_local_trust_anchors);
+ 
++  // Install any engine-wide client certificate configured via
++  // Cronet_Engine_ConfigureTls onto the session's SSLClientContext.
++  if (context_config_->tls_config &&
++      context_config_->tls_config->client_cert &&
++      context_config_->tls_config->client_key &&
++      context->http_transaction_factory() &&
++      context->http_transaction_factory()->GetSession()) {
++    context->http_transaction_factory()
++        ->GetSession()
++        ->ssl_client_context()
++        ->SetDefaultClientCertificate(
++            context_config_->tls_config->client_cert,
++            context_config_->tls_config->client_key);
++  }
++
+ #if BUILDFLAG(ENABLE_REPORTING)
+   if (context->reporting_service()) {
+     for (const auto& preloaded_header :
+diff --git a/src/components/cronet/cronet_context.h b/src/components/cronet/cronet_context.h
+index 376ff67a..64f52d0a 100644
+--- a/src/components/cronet/cronet_context.h
++++ b/src/components/cronet/cronet_context.h
+@@ -160,6 +160,10 @@ class CronetContext {
+ 
+   // Returns true if running on network thread.
+   bool IsOnNetworkThread() const;
++  // Exposes the network SingleThreadTaskRunner for Cronet_TlsClient.
++  scoped_refptr<base::SingleThreadTaskRunner> network_task_runner() const {
++    return network_task_runner_;
++  }
+ 
+   // Returns the net::URLRequestContext associated with `network`.
+   // kInvalidNetworkHandle represent the default context: this one will always
+diff --git a/src/components/cronet/native/BUILD.gn b/src/components/cronet/native/BUILD.gn
+index 425d92d0..eb8ef7c3 100644
+--- a/src/components/cronet/native/BUILD.gn
++++ b/src/components/cronet/native/BUILD.gn
+@@ -57,6 +57,8 @@ source_set("cronet_native_impl") {
+     "engine.h",
+     "stream_dialer.cc",
+     "stream_dialer.h",
++    "tls_client.cc",
++    "tls_client.h",
+     "io_buffer_with_cronet_buffer.cc",
+     "io_buffer_with_cronet_buffer.h",
+     "native_metrics_util.cc",
+diff --git a/src/components/cronet/native/engine.cc b/src/components/cronet/native/engine.cc
+index b2932c79..c3676704 100644
+--- a/src/components/cronet/native/engine.cc
++++ b/src/components/cronet/native/engine.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "base/compiler_specific.h"
+ #include "components/cronet/native/endpoint_resolver.h"
++#include "components/cronet/native/tls_client.h"
+ 
+ #include <optional>
+ #include <unordered_set>
+@@ -330,6 +331,9 @@ Cronet_RESULT Cronet_EngineImpl::StartWithParams(
+   if (endpoint_registry_) {
+     config->endpoint_registry = endpoint_registry_;
+   }
++  if (tls_config_) {
++    config->tls_config = std::move(tls_config_);
++  }
+ 
+   // Set custom UDP dialer if provided.
+   if (udp_dialer_) {
+@@ -639,6 +643,37 @@ stream_engine* Cronet_EngineImpl::GetBidirectionalStreamEngine() {
+   return stream_engine_.get();
+ }
+ 
++scoped_refptr<base::SingleThreadTaskRunner>
++Cronet_EngineImpl::GetNetworkTaskRunner() {
++  {
++    base::AutoLock lock(lock_);
++    if (!context_) {
++      return nullptr;
++    }
++  }
++  init_completed_.Wait();
++  base::AutoLock lock(lock_);
++  return context_ ? context_->network_task_runner() : nullptr;
++}
++
++bool Cronet_EngineImpl::ConfigureTls(const Cronet_TlsConfig& config,
++                                     char* err_buf,
++                                     size_t err_len) {
++  CHECK(!context_);
++  auto parsed = std::make_unique<OwnedTlsConfig>();
++  std::string error;
++  if (!ParseAndValidateTlsConfig(config, parsed.get(), &error)) {
++    if (err_buf && err_len > 0) {
++      size_t n = std::min(error.size(), err_len - 1);
++      UNSAFE_TODO(memcpy(err_buf, error.data(), n));
++      UNSAFE_TODO(err_buf[n]) = '\0';
++    }
++    return false;
++  }
++  tls_config_ = std::move(parsed);
++  return true;
++}
++
+ }  // namespace cronet
+ 
+ CRONET_EXPORT Cronet_EnginePtr Cronet_Engine_Create() {
+@@ -683,6 +718,18 @@ CRONET_EXPORT void Cronet_Engine_ClearEndpoints(Cronet_EnginePtr engine) {
+   static_cast<cronet::Cronet_EngineImpl*>(engine)->ClearEndpoints();
+ }
+ 
++CRONET_EXPORT bool Cronet_Engine_ConfigureTls(
++    Cronet_EnginePtr engine,
++    const Cronet_TlsConfig* config,
++    char* err_buf,
++    size_t err_len) {
++  if (!engine || !config) {
++    return false;
++  }
++  return static_cast<cronet::Cronet_EngineImpl*>(engine)->ConfigureTls(
++      *config, err_buf, err_len);
++}
++
+ CRONET_EXPORT void Cronet_Engine_SetDialer(Cronet_EnginePtr engine,
+                                            Cronet_DialerFunc dialer,
+                                            void* context) {
+diff --git a/src/components/cronet/native/engine.h b/src/components/cronet/native/engine.h
+index a0b97c13..c4af9e96 100644
+--- a/src/components/cronet/native/engine.h
++++ b/src/components/cronet/native/engine.h
+@@ -21,6 +21,10 @@
+ extern "C" typedef struct stream_engine stream_engine;
+ struct Cronet_LowerStream;
+ struct Cronet_LowerStreamHandle;
++struct Cronet_TlsConfig;
++namespace base {
++class SingleThreadTaskRunner;
++}
+ 
+ namespace net {
+ class CertVerifier;
+@@ -29,6 +33,7 @@ class CertVerifier;
+ namespace cronet {
+ class CronetContext;
+ class EndpointRegistry;
++struct OwnedTlsConfig;
+ 
+ // Implementation of Cronet_Engine that uses CronetContext.
+ class Cronet_EngineImpl : public Cronet_Engine {
+@@ -101,6 +106,10 @@ class Cronet_EngineImpl : public Cronet_Engine {
+   // Get stream engine for GRPC Bidirectional Stream support. The returned
+   // stream_engine is owned by |this| and is only valid until |this| shutdown.
+   stream_engine* GetBidirectionalStreamEngine();
++  scoped_refptr<base::SingleThreadTaskRunner> GetNetworkTaskRunner();
++  bool ConfigureTls(const struct Cronet_TlsConfig& config,
++                    char* err_buf,
++                    size_t err_len);
+ 
+   CronetContext* cronet_url_request_context() const { return context_.get(); }
+ 
+@@ -157,6 +166,7 @@ class Cronet_EngineImpl : public Cronet_Engine {
+   void* stream_dialer_context_ = nullptr;
+ 
+   scoped_refptr<EndpointRegistry> endpoint_registry_;
++  std::unique_ptr<OwnedTlsConfig> tls_config_;
+ 
+   // Custom dialer for UDP sockets. Only valid until StartWithParams.
+   intptr_t (*udp_dialer_)(void*,
+diff --git a/src/components/cronet/native/include/cronet_c.h b/src/components/cronet/native/include/cronet_c.h
+index 71e0e8e5..6ef81a2c 100644
+--- a/src/components/cronet/native/include/cronet_c.h
++++ b/src/components/cronet/native/include/cronet_c.h
+@@ -188,6 +188,85 @@ CRONET_EXPORT void Cronet_Engine_SetEndpoint(
+ // (or keeping active) the in-memory endpoint resolver.
+ CRONET_EXPORT void Cronet_Engine_ClearEndpoints(Cronet_EnginePtr engine);
+ 
++// Unified TLS verification, client-auth, ALPN, and ECH configuration shared by
++// Cronet_Engine_ConfigureTls and Cronet_TlsClient_Create.
++typedef struct Cronet_TlsConfig {
++  bool insecure;
++  const char* pem_root_certs;
++  const char* verify_name;
++  const uint8_t* cert_pins_sha256;
++  size_t cert_pins_count;
++  const uint8_t* key_pins_sha256;
++  size_t key_pins_count;
++  const uint8_t* client_cert_pem;
++  size_t client_cert_pem_len;
++  const uint8_t* client_key_data;
++  size_t client_key_data_len;
++  const char* alpns_comma_separated;
++  const uint8_t* ech_config_list;
++  size_t ech_config_list_len;
++  bool strict_ech;
++  int64_t time_offset_ms;
++} Cronet_TlsConfig;
++
++// Configures `engine` with the unified certificate verifier and optional client
++// certificate before StartWithParams(). Returns true on success, or false with
++// a NUL-terminated reason written to `err_buf`.
++CRONET_EXPORT bool Cronet_Engine_ConfigureTls(Cronet_EnginePtr engine,
++                                              const Cronet_TlsConfig* config,
++                                              char* err_buf,
++                                              size_t err_len);
++
++typedef struct Cronet_TlsClient Cronet_TlsClient;
++typedef struct Cronet_TlsConn Cronet_TlsConn;
++
++typedef struct Cronet_TlsConnCallbacks {
++  void (*on_handshake)(void* context,
++                       int net_error,
++                       const char* negotiated_alpn,
++                       bool ech_accepted,
++                       const uint8_t* ech_retry_configs,
++                       size_t ech_retry_configs_len);
++  void (*on_read_completed)(void* context,
++                            const uint8_t* data,
++                            int bytes_read_or_error);
++  void (*on_write_completed)(void* context, int bytes_written_or_error);
++  void (*on_closed)(void* context);
++} Cronet_TlsConnCallbacks;
++
++CRONET_EXPORT Cronet_TlsClient* Cronet_TlsClient_Create(
++    Cronet_EnginePtr engine,
++    const Cronet_TlsConfig* config,
++    char* err_buf,
++    size_t err_len);
++
++CRONET_EXPORT void Cronet_TlsClient_SetTimeOffset(Cronet_TlsClient* client,
++                                                  int64_t offset_ms);
++
++CRONET_EXPORT void Cronet_TlsClient_Destroy(Cronet_TlsClient* client);
++
++CRONET_EXPORT Cronet_TlsConn* Cronet_TlsConn_Create(
++    Cronet_TlsClient* client,
++    const char* host,
++    uint16_t port,
++    const uint8_t* ech_config_list,
++    size_t ech_config_list_len,
++    const Cronet_TlsConnCallbacks* callbacks,
++    void* callback_context,
++    Cronet_LowerStreamHandle** out_lower_handle);
++
++CRONET_EXPORT void Cronet_TlsConn_Start(
++    Cronet_TlsConn* conn,
++    const Cronet_LowerStream* lower_stream);
++
++CRONET_EXPORT void Cronet_TlsConn_Read(Cronet_TlsConn* conn, size_t max_bytes);
++
++CRONET_EXPORT void Cronet_TlsConn_Write(Cronet_TlsConn* conn,
++                                        const uint8_t* data,
++                                        size_t length);
++
++CRONET_EXPORT void Cronet_TlsConn_Destroy(Cronet_TlsConn* conn);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/components/cronet/url_request_context_config.cc b/src/components/cronet/url_request_context_config.cc
+index d1532959..cadd877a 100644
+--- a/src/components/cronet/url_request_context_config.cc
++++ b/src/components/cronet/url_request_context_config.cc
+@@ -44,6 +44,7 @@
+ #include "net/socket/client_socket_pool_manager.h"
+ #include "components/cronet/native/endpoint_resolver.h"
+ #include "components/cronet/native/stream_dialer.h"
++#include "components/cronet/native/tls_client.h"
+ #include "net/socket/custom_client_socket_factory.h"
+ #include "net/socket/ssl_client_socket.h"
+ #include "net/ssl/ssl_key_logger_impl.h"
+@@ -1088,8 +1089,17 @@ void URLRequestContextConfig::ConfigureURLRequestContextBuilder(
+         std::make_unique<CronetProxyDelegate>(*proxy_options, network_tasks));
+   }
+ 
+-  if (mock_cert_verifier)
++  // Construct the unified CertVerifier on the network thread where
++  // SequencedTaskRunner::GetCurrentDefault() is available.
++  if (tls_config) {
++    ConfiguredVerifier built;
++    std::string error;
++    if (BuildConfiguredCertVerifier(*tls_config, "", &built, &error)) {
++      context_builder->SetCertVerifier(std::move(built.verifier));
++    }
++  } else if (mock_cert_verifier) {
+     context_builder->SetCertVerifier(std::move(mock_cert_verifier));
++  }
+ 
+   // Network-bound contexts must use Chromium's network-binding socket factory.
+   // cronet-go does not expose network handles, so custom dialers are installed
+@@ -1168,9 +1178,11 @@ void URLRequestContextConfig::ConfigureURLRequestContextBuilder(
+       context_builder->set_host_resolver(
+           std::make_unique<EndpointHostResolver>(endpoint_registry));
+     }
++    const bool default_strict_ech =
++        tls_config ? tls_config->strict_ech : false;
+     context_builder->set_ssl_config_service(
+         std::make_unique<EndpointSSLConfigService>(endpoint_registry,
+-                                                   false));
++                                                   default_strict_ech));
+   }
+   // TODO(mef): Use |config| to set cookies.
+ }
+diff --git a/src/components/cronet/url_request_context_config.h b/src/components/cronet/url_request_context_config.h
+index af3d6314..fb1d1fa6 100644
+--- a/src/components/cronet/url_request_context_config.h
++++ b/src/components/cronet/url_request_context_config.h
+@@ -35,6 +35,7 @@ class URLRequestContextBuilder;
+ 
+ namespace cronet {
+ class EndpointRegistry;
++struct OwnedTlsConfig;
+ 
+ // Common configuration parameters used by Cronet to configure
+ // URLRequestContext.
+@@ -204,6 +205,7 @@ struct URLRequestContextConfig {
+   void* stream_dialer_context = nullptr;
+ 
+   scoped_refptr<EndpointRegistry> endpoint_registry;
++  std::unique_ptr<OwnedTlsConfig> tls_config;
+ 
+   // Custom UDP dialer callback. When set, this callback will be used to
+   // create UDP sockets instead of the default socket API.
+diff --git a/src/net/socket/ssl_client_socket.cc b/src/net/socket/ssl_client_socket.cc
+index 2b6cb80c..099093af 100644
+--- a/src/net/socket/ssl_client_socket.cc
++++ b/src/net/socket/ssl_client_socket.cc
+@@ -268,7 +268,22 @@ bool SSLClientContext::GetClientCertificate(
+     const HostPortPair& server,
+     scoped_refptr<X509Certificate>* client_cert,
+     scoped_refptr<SSLPrivateKey>* private_key) {
+-  return ssl_client_auth_cache_.Lookup(server, client_cert, private_key);
++  if (ssl_client_auth_cache_.Lookup(server, client_cert, private_key)) {
++    return true;
++  }
++  if (default_client_cert_ && default_client_private_key_) {
++    *client_cert = default_client_cert_;
++    *private_key = default_client_private_key_;
++    return true;
++  }
++  return false;
++}
++
++void SSLClientContext::SetDefaultClientCertificate(
++    scoped_refptr<X509Certificate> client_cert,
++    scoped_refptr<SSLPrivateKey> private_key) {
++  default_client_cert_ = std::move(client_cert);
++  default_client_private_key_ = std::move(private_key);
+ }
+ 
+ void SSLClientContext::SetClientCertificate(
+diff --git a/src/net/socket/ssl_client_socket.h b/src/net/socket/ssl_client_socket.h
+index 4046a961..8241f08a 100644
+--- a/src/net/socket/ssl_client_socket.h
++++ b/src/net/socket/ssl_client_socket.h
+@@ -217,6 +217,12 @@ class NET_EXPORT SSLClientContext : public SSLConfigService::Observer,
+                             scoped_refptr<X509Certificate> client_cert,
+                             scoped_refptr<SSLPrivateKey> private_key);
+ 
++  // Sets a fallback client certificate used for any server without an
++  // explicit per-origin entry in `ssl_client_auth_cache_`.
++  void SetDefaultClientCertificate(
++      scoped_refptr<X509Certificate> client_cert,
++      scoped_refptr<SSLPrivateKey> private_key);
++
+   // Clears a client certificate preference for |server| set by
+   // SetClientCertificate(). Returns true if one was removed and false
+   // otherwise.
+@@ -279,6 +285,8 @@ class NET_EXPORT SSLClientContext : public SSLConfigService::Observer,
+   raw_ptr<SCTAuditingDelegate> sct_auditing_delegate_;
+ 
+   SSLClientAuthCache ssl_client_auth_cache_;
++  scoped_refptr<X509Certificate> default_client_cert_;
++  scoped_refptr<SSLPrivateKey> default_client_private_key_;
+ 
+   base::ObserverList<Observer, true /* check_empty */> observers_;
+ };

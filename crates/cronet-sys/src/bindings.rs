@@ -501,6 +501,103 @@ pub type Cronet_UdpDialerFunc = Option<
 
 pub type Cronet_UdpSocketCloseFunc = Option<unsafe extern "C" fn(socket_id: u64)>;
 
+/// Readiness flags for Cronet_LowerStreamHandle_Notify.
+pub type Cronet_LowerReady = c_int;
+pub const Cronet_LowerReady_READABLE: Cronet_LowerReady = 1;
+pub const Cronet_LowerReady_WRITABLE: Cronet_LowerReady = 2;
+
+/// Thread-safe handle used by an embedder to wake a pending read or write on a
+/// Cronet_LowerStream from any thread.
+#[repr(C)]
+pub struct Cronet_LowerStreamHandle {
+    _data: [u8; 0],
+    _marker: PhantomData<(*mut u8, PhantomPinned)>,
+}
+
+/// Non-blocking byte stream owned by the embedder.
+/// `read` returns bytes read (> 0), 0 on clean EOF, -1 (ERR_IO_PENDING) when no
+/// data is ready yet, or another negative Chromium net error code.
+/// `write` returns bytes written (> 0), -1 (ERR_IO_PENDING) when congested, or
+/// another negative Chromium net error code.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Cronet_LowerStream {
+    pub context: *mut c_void,
+    pub read: Option<unsafe extern "C" fn(context: *mut c_void, buffer: *mut u8, capacity: usize) -> isize>,
+    pub write: Option<unsafe extern "C" fn(context: *mut c_void, data: *const u8, length: usize) -> isize>,
+    pub close: Option<unsafe extern "C" fn(context: *mut c_void)>,
+}
+
+/// Callback invoked on the network thread to open a byte stream to `host:port`.
+/// On success (return 0), the callback takes ownership of `handle` (freeing it
+/// with Cronet_LowerStreamHandle_Destroy after `close` runs) and populates
+/// `out_stream`. On failure (return a negative net error code), Cronet frees
+/// `handle`.
+pub type Cronet_StreamDialerFunc = Option<
+    unsafe extern "C" fn(
+        context: *mut c_void,
+        host: *const c_char,
+        port: u16,
+        connection_id: u64,
+        handle: *mut Cronet_LowerStreamHandle,
+        out_stream: *mut Cronet_LowerStream,
+    ) -> c_int,
+>;
+
+/// Unified TLS verification, client-auth, ALPN, and ECH configuration shared by
+/// Cronet_Engine_ConfigureTls and Cronet_TlsClient_Create.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Cronet_TlsConfig {
+    pub insecure: bool,
+    pub pem_root_certs: *const c_char,
+    pub verify_name: *const c_char,
+    pub cert_pins_sha256: *const u8,
+    pub cert_pins_count: usize,
+    pub key_pins_sha256: *const u8,
+    pub key_pins_count: usize,
+    pub client_cert_pem: *const u8,
+    pub client_cert_pem_len: usize,
+    pub client_key_data: *const u8,
+    pub client_key_data_len: usize,
+    pub alpns_comma_separated: *const c_char,
+    pub ech_config_list: *const u8,
+    pub ech_config_list_len: usize,
+    pub strict_ech: bool,
+    pub time_offset_ms: i64,
+}
+
+#[repr(C)]
+pub struct Cronet_TlsClient {
+    _data: [u8; 0],
+    _marker: PhantomData<(*mut u8, PhantomPinned)>,
+}
+
+#[repr(C)]
+pub struct Cronet_TlsConn {
+    _data: [u8; 0],
+    _marker: PhantomData<(*mut u8, PhantomPinned)>,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Cronet_TlsConnCallbacks {
+    pub on_handshake: Option<
+        unsafe extern "C" fn(
+            context: *mut c_void,
+            net_error: c_int,
+            negotiated_alpn: *const c_char,
+            ech_accepted: bool,
+            ech_retry_configs: *const u8,
+            ech_retry_configs_len: usize,
+        ),
+    >,
+    pub on_read_completed:
+        Option<unsafe extern "C" fn(context: *mut c_void, data: *const u8, bytes_read_or_error: c_int)>,
+    pub on_write_completed: Option<unsafe extern "C" fn(context: *mut c_void, bytes_written_or_error: c_int)>,
+    pub on_closed: Option<unsafe extern "C" fn(context: *mut c_void)>,
+}
+
 /// Opaque object representing a Bidirectional stream creating engine. Created
 /// and configured outside of this API to facilitate sharing with other
 /// components
@@ -1171,6 +1268,70 @@ cronet_api! {
     /// Must be called after Cronet_Engine_StartWithParams().
     /// Calls from Cronet's network thread schedule the close asynchronously.
     pub fn Cronet_Engine_CloseAllConnections(engine: Cronet_EnginePtr);
+    /// Sets a custom stream dialer on `engine` before StartWithParams. When set,
+    /// TCP connections run over embedder-provided Cronet_LowerStream instances
+    /// rather than OS file descriptors.
+    pub fn Cronet_Engine_SetStreamDialer(
+        engine: Cronet_EnginePtr,
+        dialer: Cronet_StreamDialerFunc,
+        context: *mut c_void,
+    );
+    /// Signals that a Cronet_LowerStream may now make progress on READABLE and/or
+    /// WRITABLE operations. Safe to call from any thread.
+    pub fn Cronet_LowerStreamHandle_Notify(handle: *mut Cronet_LowerStreamHandle, flags: u32);
+    /// Releases a Cronet_LowerStreamHandle previously handed to a stream dialer or
+    /// TLS connection.
+    pub fn Cronet_LowerStreamHandle_Destroy(handle: *mut Cronet_LowerStreamHandle);
+    /// Returns the `connection_id` of the transport connection carrying `stream`,
+    /// or 0 if not established over a custom stream dialer.
+    pub fn Cronet_BidirectionalStream_GetConnectionId(stream: *mut bidirectional_stream) -> u64;
+    /// Registers or updates synthetic endpoint metadata (ECHConfigList, comma-
+    /// separated ALPNs such as "h2" or "h3,h2", and strict ECH enforcement) for
+    /// `host` on `engine`. May be called both before and after StartWithParams().
+    /// Enabling any endpoint installs an in-memory HostResolver that never queries
+    /// system or network DNS.
+    pub fn Cronet_Engine_SetEndpoint(
+        engine: Cronet_EnginePtr,
+        host: *const c_char,
+        ech_config_list: *const u8,
+        ech_config_list_len: usize,
+        alpns_comma_separated: *const c_char,
+        strict_ech: bool,
+    );
+    /// Clears all registered endpoint metadata entries on `engine` while enabling
+    /// (or keeping active) the in-memory endpoint resolver.
+    pub fn Cronet_Engine_ClearEndpoints(engine: Cronet_EnginePtr);
+    /// Configures `engine` with the unified certificate verifier and optional client
+    /// certificate before StartWithParams(). Returns true on success, or false with
+    /// a NUL-terminated reason written to `err_buf`.
+    pub fn Cronet_Engine_ConfigureTls(
+        engine: Cronet_EnginePtr,
+        config: *const Cronet_TlsConfig,
+        err_buf: *mut c_char,
+        err_len: usize,
+    ) -> bool;
+    pub fn Cronet_TlsClient_Create(
+        engine: Cronet_EnginePtr,
+        config: *const Cronet_TlsConfig,
+        err_buf: *mut c_char,
+        err_len: usize,
+    ) -> *mut Cronet_TlsClient;
+    pub fn Cronet_TlsClient_SetTimeOffset(client: *mut Cronet_TlsClient, offset_ms: i64);
+    pub fn Cronet_TlsClient_Destroy(client: *mut Cronet_TlsClient);
+    pub fn Cronet_TlsConn_Create(
+        client: *mut Cronet_TlsClient,
+        host: *const c_char,
+        port: u16,
+        ech_config_list: *const u8,
+        ech_config_list_len: usize,
+        callbacks: *const Cronet_TlsConnCallbacks,
+        callback_context: *mut c_void,
+        out_lower_handle: *mut *mut Cronet_LowerStreamHandle,
+    ) -> *mut Cronet_TlsConn;
+    pub fn Cronet_TlsConn_Start(conn: *mut Cronet_TlsConn, lower_stream: *const Cronet_LowerStream);
+    pub fn Cronet_TlsConn_Read(conn: *mut Cronet_TlsConn, max_bytes: usize);
+    pub fn Cronet_TlsConn_Write(conn: *mut Cronet_TlsConn, data: *const u8, length: usize);
+    pub fn Cronet_TlsConn_Destroy(conn: *mut Cronet_TlsConn);
     /// Creates a new stream object that uses |engine| and |callback|. All stream
     /// tasks are performed asynchronously on the |engine| network thread. |callback|
     /// methods are invoked synchronously on the |engine| network thread, but must
@@ -1252,4 +1413,6 @@ cronet_api! {
     /// be invoked. At most one callback method may be invoked after
     /// bidirectional_stream_cancel() has completed.
     pub fn bidirectional_stream_cancel(stream: *mut bidirectional_stream);
+    /// Returns the NetLog socket ID of the underlying transport/SSL socket, or 0.
+    pub fn bidirectional_stream_get_socket_log_id(stream: *mut bidirectional_stream) -> u32;
 }

@@ -5,6 +5,7 @@
 #ifndef COMPONENTS_CRONET_NATIVE_INCLUDE_CRONET_C_H_
 #define COMPONENTS_CRONET_NATIVE_INCLUDE_CRONET_C_H_
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "cronet_export.h"
@@ -18,6 +19,7 @@ extern "C" {
 
 // Stream Engine used by Bidirectional Stream C API for GRPC.
 typedef struct stream_engine stream_engine;
+typedef struct bidirectional_stream bidirectional_stream;
 
 // Additional Cronet C API not generated from cronet.idl.
 
@@ -110,6 +112,160 @@ CRONET_EXPORT void Cronet_Engine_SetUdpDialer(
 // Must be called after Cronet_Engine_StartWithParams().
 // Calls from Cronet's network thread schedule the close asynchronously.
 CRONET_EXPORT void Cronet_Engine_CloseAllConnections(Cronet_EnginePtr engine);
+
+// Readiness flags for Cronet_LowerStreamHandle_Notify.
+typedef enum Cronet_LowerReady {
+  Cronet_LowerReady_READABLE = 1,
+  Cronet_LowerReady_WRITABLE = 2,
+} Cronet_LowerReady;
+
+// Thread-safe handle used by an embedder to wake a pending read or write on a
+// Cronet_LowerStream from any thread.
+typedef struct Cronet_LowerStreamHandle Cronet_LowerStreamHandle;
+
+// Non-blocking byte stream owned by the embedder.
+// `read` returns bytes read (> 0), 0 on clean EOF, -1 (ERR_IO_PENDING) when no
+// data is ready yet, or another negative Chromium net error code.
+// `write` returns bytes written (> 0), -1 (ERR_IO_PENDING) when congested, or
+// another negative Chromium net error code.
+typedef struct Cronet_LowerStream {
+  void* context;
+  intptr_t (*read)(void* context, uint8_t* buffer, size_t capacity);
+  intptr_t (*write)(void* context, const uint8_t* data, size_t length);
+  void (*close)(void* context);
+} Cronet_LowerStream;
+
+// Callback invoked on the network thread to open a byte stream to `host:port`.
+// On success (return 0), the callback takes ownership of `handle` (freeing it
+// with Cronet_LowerStreamHandle_Destroy after `close` runs) and populates
+// `out_stream`. On failure (return a negative net error code), Cronet frees
+// `handle`.
+typedef int (*Cronet_StreamDialerFunc)(void* context,
+                                       const char* host,
+                                       uint16_t port,
+                                       uint64_t connection_id,
+                                       Cronet_LowerStreamHandle* handle,
+                                       Cronet_LowerStream* out_stream);
+
+// Sets a custom stream dialer on `engine` before StartWithParams. When set,
+// TCP connections run over embedder-provided Cronet_LowerStream instances
+// rather than OS file descriptors.
+CRONET_EXPORT void Cronet_Engine_SetStreamDialer(
+    Cronet_EnginePtr engine,
+    Cronet_StreamDialerFunc dialer,
+    void* context);
+
+// Signals that a Cronet_LowerStream may now make progress on READABLE and/or
+// WRITABLE operations. Safe to call from any thread.
+CRONET_EXPORT void Cronet_LowerStreamHandle_Notify(
+    Cronet_LowerStreamHandle* handle,
+    uint32_t flags);
+
+// Releases a Cronet_LowerStreamHandle previously handed to a stream dialer or
+// TLS connection.
+CRONET_EXPORT void Cronet_LowerStreamHandle_Destroy(
+    Cronet_LowerStreamHandle* handle);
+
+// Returns the `connection_id` of the transport connection carrying `stream`,
+// or 0 if not established over a custom stream dialer.
+CRONET_EXPORT uint64_t Cronet_BidirectionalStream_GetConnectionId(
+    bidirectional_stream* stream);
+
+// Registers or updates synthetic endpoint metadata (ECHConfigList, comma-
+// separated ALPNs such as "h2" or "h3,h2", and strict ECH enforcement) for
+// `host` on `engine`. May be called both before and after StartWithParams().
+// Enabling any endpoint installs an in-memory HostResolver that never queries
+// system or network DNS.
+CRONET_EXPORT void Cronet_Engine_SetEndpoint(
+    Cronet_EnginePtr engine,
+    const char* host,
+    const uint8_t* ech_config_list,
+    size_t ech_config_list_len,
+    const char* alpns_comma_separated,
+    bool strict_ech);
+
+// Clears all registered endpoint metadata entries on `engine` while enabling
+// (or keeping active) the in-memory endpoint resolver.
+CRONET_EXPORT void Cronet_Engine_ClearEndpoints(Cronet_EnginePtr engine);
+
+// Unified TLS verification, client-auth, ALPN, and ECH configuration shared by
+// Cronet_Engine_ConfigureTls and Cronet_TlsClient_Create.
+typedef struct Cronet_TlsConfig {
+  bool insecure;
+  const char* pem_root_certs;
+  const char* verify_name;
+  const uint8_t* cert_pins_sha256;
+  size_t cert_pins_count;
+  const uint8_t* key_pins_sha256;
+  size_t key_pins_count;
+  const uint8_t* client_cert_pem;
+  size_t client_cert_pem_len;
+  const uint8_t* client_key_data;
+  size_t client_key_data_len;
+  const char* alpns_comma_separated;
+  const uint8_t* ech_config_list;
+  size_t ech_config_list_len;
+  bool strict_ech;
+  int64_t time_offset_ms;
+} Cronet_TlsConfig;
+
+// Configures `engine` with the unified certificate verifier and optional client
+// certificate before StartWithParams(). Returns true on success, or false with
+// a NUL-terminated reason written to `err_buf`.
+CRONET_EXPORT bool Cronet_Engine_ConfigureTls(Cronet_EnginePtr engine,
+                                              const Cronet_TlsConfig* config,
+                                              char* err_buf,
+                                              size_t err_len);
+
+typedef struct Cronet_TlsClient Cronet_TlsClient;
+typedef struct Cronet_TlsConn Cronet_TlsConn;
+
+typedef struct Cronet_TlsConnCallbacks {
+  void (*on_handshake)(void* context,
+                       int net_error,
+                       const char* negotiated_alpn,
+                       bool ech_accepted,
+                       const uint8_t* ech_retry_configs,
+                       size_t ech_retry_configs_len);
+  void (*on_read_completed)(void* context,
+                            const uint8_t* data,
+                            int bytes_read_or_error);
+  void (*on_write_completed)(void* context, int bytes_written_or_error);
+  void (*on_closed)(void* context);
+} Cronet_TlsConnCallbacks;
+
+CRONET_EXPORT Cronet_TlsClient* Cronet_TlsClient_Create(
+    Cronet_EnginePtr engine,
+    const Cronet_TlsConfig* config,
+    char* err_buf,
+    size_t err_len);
+
+CRONET_EXPORT void Cronet_TlsClient_SetTimeOffset(Cronet_TlsClient* client,
+                                                  int64_t offset_ms);
+
+CRONET_EXPORT void Cronet_TlsClient_Destroy(Cronet_TlsClient* client);
+
+CRONET_EXPORT Cronet_TlsConn* Cronet_TlsConn_Create(
+    Cronet_TlsClient* client,
+    const char* host,
+    uint16_t port,
+    const uint8_t* ech_config_list,
+    size_t ech_config_list_len,
+    const Cronet_TlsConnCallbacks* callbacks,
+    void* callback_context,
+    Cronet_LowerStreamHandle** out_lower_handle);
+
+CRONET_EXPORT void Cronet_TlsConn_Start(
+    Cronet_TlsConn* conn,
+    const Cronet_LowerStream* lower_stream);
+
+CRONET_EXPORT void Cronet_TlsConn_Read(Cronet_TlsConn* conn, size_t max_bytes);
+
+CRONET_EXPORT void Cronet_TlsConn_Write(Cronet_TlsConn* conn,
+                                        const uint8_t* data,
+                                        size_t length);
+
+CRONET_EXPORT void Cronet_TlsConn_Destroy(Cronet_TlsConn* conn);
 
 #ifdef __cplusplus
 }

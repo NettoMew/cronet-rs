@@ -16,6 +16,7 @@ extern "C" {
 #endif
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* Engine API. */
 
@@ -237,6 +238,10 @@ void bidirectional_stream_cancel(bidirectional_stream* stream);
  */
 GRPC_SUPPORT_EXPORT
 bool bidirectional_stream_is_done(bidirectional_stream* stream);
+
+/* Returns the NetLog socket ID of the underlying transport/SSL socket, or 0. */
+GRPC_SUPPORT_EXPORT
+uint32_t bidirectional_stream_get_socket_log_id(bidirectional_stream* stream);
 
 #ifdef __cplusplus
 }

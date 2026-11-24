@@ -1,0 +1,407 @@
+diff --git a/src/components/cronet/native/BUILD.gn b/src/components/cronet/native/BUILD.gn
+index 90cac672..1cac9ec9 100644
+--- a/src/components/cronet/native/BUILD.gn
++++ b/src/components/cronet/native/BUILD.gn
+@@ -53,6 +53,8 @@ source_set("cronet_native_impl") {
+     "buffer.cc",
+     "engine.cc",
+     "engine.h",
++    "stream_dialer.cc",
++    "stream_dialer.h",
+     "io_buffer_with_cronet_buffer.cc",
+     "io_buffer_with_cronet_buffer.h",
+     "native_metrics_util.cc",
+diff --git a/src/components/cronet/native/engine.cc b/src/components/cronet/native/engine.cc
+index bdff7fd9..b1ef4171 100644
+--- a/src/components/cronet/native/engine.cc
++++ b/src/components/cronet/native/engine.cc
+@@ -312,6 +312,12 @@ Cronet_RESULT Cronet_EngineImpl::StartWithParams(
+     dialer_ = nullptr;
+     dialer_context_ = nullptr;
+   }
++  if (stream_dialer_) {
++    config->stream_dialer = stream_dialer_;
++    config->stream_dialer_context = stream_dialer_context_;
++    stream_dialer_ = nullptr;
++    stream_dialer_context_ = nullptr;
++  }
+ 
+   // Set custom UDP dialer if provided.
+   if (udp_dialer_) {
+@@ -536,6 +542,19 @@ void Cronet_EngineImpl::SetDialer(
+   dialer_context_ = context;
+ }
+ 
++void Cronet_EngineImpl::SetStreamDialer(
++    int (*dialer)(void*,
++                  const char*,
++                  uint16_t,
++                  uint64_t,
++                  Cronet_LowerStreamHandle*,
++                  Cronet_LowerStream*),
++    void* context) {
++  CHECK(!context_);
++  stream_dialer_ = dialer;
++  stream_dialer_context_ = context;
++}
++
+ void Cronet_EngineImpl::SetUdpDialer(intptr_t (*dialer)(void*,
+                                                         const char*,
+                                                         uint16_t,
+@@ -609,6 +628,14 @@ CRONET_EXPORT void Cronet_Engine_SetDialer(Cronet_EnginePtr engine,
+   engine_impl->SetDialer(dialer, context);
+ }
+ 
++CRONET_EXPORT void Cronet_Engine_SetStreamDialer(
++    Cronet_EnginePtr engine,
++    Cronet_StreamDialerFunc dialer,
++    void* context) {
++  static_cast<cronet::Cronet_EngineImpl*>(engine)->SetStreamDialer(dialer,
++                                                                   context);
++}
++
+ CRONET_EXPORT void Cronet_Engine_SetUdpDialer(
+     Cronet_EnginePtr engine,
+     Cronet_UdpDialerFunc dialer,
+diff --git a/src/components/cronet/native/engine.h b/src/components/cronet/native/engine.h
+index 7d005a65..228728ff 100644
+--- a/src/components/cronet/native/engine.h
++++ b/src/components/cronet/native/engine.h
+@@ -19,6 +19,8 @@
+ #include "components/cronet/native/generated/cronet.idl_impl_interface.h"
+ 
+ extern "C" typedef struct stream_engine stream_engine;
++struct Cronet_LowerStream;
++struct Cronet_LowerStreamHandle;
+ 
+ namespace net {
+ class CertVerifier;
+@@ -65,6 +67,16 @@ class Cronet_EngineImpl : public Cronet_Engine {
+   void SetDialer(intptr_t (*dialer)(void*, const char*, uint16_t),
+                  void* context);
+ 
++  // Set custom byte-stream dialer for TCP connections (takes precedence
++  // over fd dialer). Must be called before StartWithParams.
++  void SetStreamDialer(int (*dialer)(void*,
++                                     const char*,
++                                     uint16_t,
++                                     uint64_t,
++                                     struct Cronet_LowerStreamHandle*,
++                                     struct Cronet_LowerStream*),
++                       void* context);
++
+   // Set custom dialer for UDP sockets. Must be called before StartWithParams.
+   void SetUdpDialer(intptr_t (*dialer)(void*,
+                                        const char*,
+@@ -128,6 +140,14 @@ class Cronet_EngineImpl : public Cronet_Engine {
+   intptr_t (*dialer_)(void*, const char*, uint16_t) = nullptr;
+   void* dialer_context_ = nullptr;
+ 
++  int (*stream_dialer_)(void*,
++                        const char*,
++                        uint16_t,
++                        uint64_t,
++                        struct Cronet_LowerStreamHandle*,
++                        struct Cronet_LowerStream*) = nullptr;
++  void* stream_dialer_context_ = nullptr;
++
+   // Custom dialer for UDP sockets. Only valid until StartWithParams.
+   intptr_t (*udp_dialer_)(void*,
+                           const char*,
+diff --git a/src/components/cronet/native/include/cronet_c.h b/src/components/cronet/native/include/cronet_c.h
+index 6bdec585..c7815d74 100644
+--- a/src/components/cronet/native/include/cronet_c.h
++++ b/src/components/cronet/native/include/cronet_c.h
+@@ -5,6 +5,7 @@
+ #ifndef COMPONENTS_CRONET_NATIVE_INCLUDE_CRONET_C_H_
+ #define COMPONENTS_CRONET_NATIVE_INCLUDE_CRONET_C_H_
+ 
++#include <stddef.h>
+ #include <stdint.h>
+ 
+ #include "cronet_export.h"
+@@ -18,6 +19,7 @@ extern "C" {
+ 
+ // Stream Engine used by Bidirectional Stream C API for GRPC.
+ typedef struct stream_engine stream_engine;
++typedef struct bidirectional_stream bidirectional_stream;
+ 
+ // Additional Cronet C API not generated from cronet.idl.
+ 
+@@ -111,6 +113,64 @@ CRONET_EXPORT void Cronet_Engine_SetUdpDialer(
+ // Calls from Cronet's network thread schedule the close asynchronously.
+ CRONET_EXPORT void Cronet_Engine_CloseAllConnections(Cronet_EnginePtr engine);
+ 
++// Readiness flags for Cronet_LowerStreamHandle_Notify.
++typedef enum Cronet_LowerReady {
++  Cronet_LowerReady_READABLE = 1,
++  Cronet_LowerReady_WRITABLE = 2,
++} Cronet_LowerReady;
++
++// Thread-safe handle used by an embedder to wake a pending read or write on a
++// Cronet_LowerStream from any thread.
++typedef struct Cronet_LowerStreamHandle Cronet_LowerStreamHandle;
++
++// Non-blocking byte stream owned by the embedder.
++// `read` returns bytes read (> 0), 0 on clean EOF, -1 (ERR_IO_PENDING) when no
++// data is ready yet, or another negative Chromium net error code.
++// `write` returns bytes written (> 0), -1 (ERR_IO_PENDING) when congested, or
++// another negative Chromium net error code.
++typedef struct Cronet_LowerStream {
++  void* context;
++  intptr_t (*read)(void* context, uint8_t* buffer, size_t capacity);
++  intptr_t (*write)(void* context, const uint8_t* data, size_t length);
++  void (*close)(void* context);
++} Cronet_LowerStream;
++
++// Callback invoked on the network thread to open a byte stream to `host:port`.
++// On success (return 0), the callback takes ownership of `handle` (freeing it
++// with Cronet_LowerStreamHandle_Destroy after `close` runs) and populates
++// `out_stream`. On failure (return a negative net error code), Cronet frees
++// `handle`.
++typedef int (*Cronet_StreamDialerFunc)(void* context,
++                                       const char* host,
++                                       uint16_t port,
++                                       uint64_t connection_id,
++                                       Cronet_LowerStreamHandle* handle,
++                                       Cronet_LowerStream* out_stream);
++
++// Sets a custom stream dialer on `engine` before StartWithParams. When set,
++// TCP connections run over embedder-provided Cronet_LowerStream instances
++// rather than OS file descriptors.
++CRONET_EXPORT void Cronet_Engine_SetStreamDialer(
++    Cronet_EnginePtr engine,
++    Cronet_StreamDialerFunc dialer,
++    void* context);
++
++// Signals that a Cronet_LowerStream may now make progress on READABLE and/or
++// WRITABLE operations. Safe to call from any thread.
++CRONET_EXPORT void Cronet_LowerStreamHandle_Notify(
++    Cronet_LowerStreamHandle* handle,
++    uint32_t flags);
++
++// Releases a Cronet_LowerStreamHandle previously handed to a stream dialer or
++// TLS connection.
++CRONET_EXPORT void Cronet_LowerStreamHandle_Destroy(
++    Cronet_LowerStreamHandle* handle);
++
++// Returns the `connection_id` of the transport connection carrying `stream`,
++// or 0 if not established over a custom stream dialer.
++CRONET_EXPORT uint64_t Cronet_BidirectionalStream_GetConnectionId(
++    bidirectional_stream* stream);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/components/cronet/url_request_context_config.cc b/src/components/cronet/url_request_context_config.cc
+index f8710673..3561fa83 100644
+--- a/src/components/cronet/url_request_context_config.cc
++++ b/src/components/cronet/url_request_context_config.cc
+@@ -42,6 +42,7 @@
+ #include "net/nqe/network_quality_estimator_params.h"
+ #include "net/quic/set_quic_flag.h"
+ #include "net/socket/client_socket_pool_manager.h"
++#include "components/cronet/native/stream_dialer.h"
+ #include "net/socket/custom_client_socket_factory.h"
+ #include "net/socket/ssl_client_socket.h"
+ #include "net/ssl/ssl_key_logger_impl.h"
+@@ -1130,9 +1131,24 @@ void URLRequestContextConfig::ConfigureURLRequestContextBuilder(
+           udp_dialer_copy, udp_context_copy, udp_socket_close);
+     }
+ 
+-    auto custom_factory = std::make_unique<net::CustomClientSocketFactory>(
+-        std::move(tcp_dialer_callback), std::move(udp_dialer_callback));
+-    context_builder->set_client_socket_factory(std::move(custom_factory));
++    std::unique_ptr<net::ClientSocketFactory> factory =
++        std::make_unique<net::CustomClientSocketFactory>(
++            std::move(tcp_dialer_callback), std::move(udp_dialer_callback));
++    // When a custom stream dialer is set, wrap the socket factory so TCP
++    // streams use Cronet_LowerStream while UDP datagram sockets continue
++    // delegating to CustomClientSocketFactory.
++    if (stream_dialer) {
++      factory = std::make_unique<StreamClientSocketFactory>(
++          stream_dialer, stream_dialer_context, HostLookupCallback(),
++          std::move(factory));
++    }
++    context_builder->set_client_socket_factory(std::move(factory));
++  } else if (stream_dialer &&
++             bound_network == net::handles::kInvalidNetworkHandle) {
++    context_builder->set_client_socket_factory(
++        std::make_unique<StreamClientSocketFactory>(
++            stream_dialer, stream_dialer_context, HostLookupCallback(),
++            nullptr));
+   }
+   // TODO(mef): Use |config| to set cookies.
+ }
+diff --git a/src/components/cronet/url_request_context_config.h b/src/components/cronet/url_request_context_config.h
+index 3f82d359..ef7b0d11 100644
+--- a/src/components/cronet/url_request_context_config.h
++++ b/src/components/cronet/url_request_context_config.h
+@@ -23,6 +23,9 @@
+ #include "net/nqe/effective_connection_type.h"
+ #include "url/origin.h"
+ 
++struct Cronet_LowerStream;
++struct Cronet_LowerStreamHandle;
++
+ namespace net {
+ class CertVerifier;
+ struct HttpNetworkSessionParams;
+@@ -191,6 +194,14 @@ struct URLRequestContextConfig {
+   intptr_t (*dialer)(void*, const char*, uint16_t) = nullptr;
+   void* dialer_context = nullptr;
+ 
++  int (*stream_dialer)(void*,
++                       const char*,
++                       uint16_t,
++                       uint64_t,
++                       struct Cronet_LowerStreamHandle*,
++                       struct Cronet_LowerStream*) = nullptr;
++  void* stream_dialer_context = nullptr;
++
+   // Custom UDP dialer callback. When set, this callback will be used to
+   // create UDP sockets instead of the default socket API.
+   // The callback takes (context, address, port, out_local_address,
+diff --git a/src/components/grpc_support/bidirectional_stream.cc b/src/components/grpc_support/bidirectional_stream.cc
+index 069db56b..3850690b 100644
+--- a/src/components/grpc_support/bidirectional_stream.cc
++++ b/src/components/grpc_support/bidirectional_stream.cc
+@@ -19,6 +19,7 @@
+ #include "base/task/single_thread_task_runner.h"
+ #include "net/base/http_user_agent_settings.h"
+ #include "net/base/io_buffer.h"
++#include "net/base/load_timing_info.h"
+ #include "net/base/net_errors.h"
+ #include "net/base/request_priority.h"
+ #include "net/base/schemeful_site.h"
+@@ -177,6 +178,15 @@ void BidirectionalStream::OnStreamReady(bool request_headers_sent) {
+     }
+     write_state_ = WRITING_DONE;
+   }
++  // Snapshot the transport socket's NetLog ID for thread-safe lookup via
++  // Cronet_BidirectionalStream_GetConnectionId.
++  if (bidi_stream_) {
++    net::LoadTimingInfo timing;
++    bidi_stream_->GetLoadTimingInfo(&timing);
++    if (timing.socket_log_id != 0) {
++      socket_log_id_.store(timing.socket_log_id, std::memory_order_relaxed);
++    }
++  }
+   delegate_->OnStreamReady();
+ }
+ 
+@@ -205,6 +215,13 @@ void BidirectionalStream::OnHeadersReceived(
+     default:
+       break;
+   }
++  if (bidi_stream_) {
++    net::LoadTimingInfo timing;
++    bidi_stream_->GetLoadTimingInfo(&timing);
++    if (timing.socket_log_id != 0) {
++      socket_log_id_.store(timing.socket_log_id, std::memory_order_relaxed);
++    }
++  }
+   delegate_->OnHeadersReceived(response_headers, protocol);
+ }
+ 
+diff --git a/src/components/grpc_support/bidirectional_stream.h b/src/components/grpc_support/bidirectional_stream.h
+index 2cec8e19..e4acf666 100644
+--- a/src/components/grpc_support/bidirectional_stream.h
++++ b/src/components/grpc_support/bidirectional_stream.h
+@@ -5,6 +5,9 @@
+ #ifndef COMPONENTS_GRPC_SUPPORT_BIDIRECTIONAL_STREAM_H_
+ #define COMPONENTS_GRPC_SUPPORT_BIDIRECTIONAL_STREAM_H_
+ 
++#include <stdint.h>
++
++#include <atomic>
+ #include <memory>
+ #include <vector>
+ 
+@@ -109,6 +112,11 @@ class BidirectionalStream : public net::BidirectionalStream::Delegate {
+   // caneceled, and not other callbacks are invoked afterwards..
+   void Cancel();
+ 
++  // Thread-safe accessor for the underlying socket's NetLog ID.
++  uint32_t socket_log_id() const {
++    return socket_log_id_.load(std::memory_order_relaxed);
++  }
++
+  private:
+   // States of BidirectionalStream are tracked in |read_state_| and
+   // |write_state_|.
+@@ -237,6 +245,7 @@ class BidirectionalStream : public net::BidirectionalStream::Delegate {
+   // Write data that is sending.
+   std::unique_ptr<WriteBuffers> sending_write_data_;
+ 
++  std::atomic<uint32_t> socket_log_id_{0};
+   std::unique_ptr<net::BidirectionalStream> bidi_stream_;
+   raw_ptr<Delegate> delegate_;
+ 
+diff --git a/src/components/grpc_support/bidirectional_stream_c.cc b/src/components/grpc_support/bidirectional_stream_c.cc
+index 8988a281..dc4a4971 100644
+--- a/src/components/grpc_support/bidirectional_stream_c.cc
++++ b/src/components/grpc_support/bidirectional_stream_c.cc
+@@ -299,3 +299,10 @@ void bidirectional_stream_flush(bidirectional_stream* stream) {
+ void bidirectional_stream_cancel(bidirectional_stream* stream) {
+   BidirectionalStreamAdapter::GetStream(stream)->Cancel();
+ }
++
++uint32_t bidirectional_stream_get_socket_log_id(bidirectional_stream* stream) {
++  if (!stream || !stream->obj) {
++    return 0;
++  }
++  return BidirectionalStreamAdapter::GetStream(stream)->socket_log_id();
++}
+diff --git a/src/components/grpc_support/include/bidirectional_stream_c.h b/src/components/grpc_support/include/bidirectional_stream_c.h
+index 943fe854..1a8dbd2c 100644
+--- a/src/components/grpc_support/include/bidirectional_stream_c.h
++++ b/src/components/grpc_support/include/bidirectional_stream_c.h
+@@ -16,6 +16,7 @@ extern "C" {
+ #endif
+ 
+ #include <stddef.h>
++#include <stdint.h>
+ 
+ /* Engine API. */
+ 
+@@ -238,6 +239,10 @@ void bidirectional_stream_cancel(bidirectional_stream* stream);
+ GRPC_SUPPORT_EXPORT
+ bool bidirectional_stream_is_done(bidirectional_stream* stream);
+ 
++/* Returns the NetLog socket ID of the underlying transport/SSL socket, or 0. */
++GRPC_SUPPORT_EXPORT
++uint32_t bidirectional_stream_get_socket_log_id(bidirectional_stream* stream);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/net/http/bidirectional_stream.cc b/src/net/http/bidirectional_stream.cc
+index 46fda0c7..2e0e2932 100644
+--- a/src/net/http/bidirectional_stream.cc
++++ b/src/net/http/bidirectional_stream.cc
+@@ -242,6 +242,15 @@ void BidirectionalStream::OnStreamReady(bool request_headers_sent) {
+         NetLogEventType::BIDIRECTIONAL_STREAM_READY, NetLogEventPhase::NONE,
+         "request_headers_sent", request_headers_sent);
+   }
++  // Propagate the underlying socket's NetLog ID before OnStreamReady so
++  // embedders using a custom stream dialer can correlate streams with
++  // their transport connection.
++  if (stream_impl_) {
++    LoadTimingInfo impl_load_timing_info;
++    if (stream_impl_->GetLoadTimingInfo(&impl_load_timing_info)) {
++      load_timing_info_.socket_log_id = impl_load_timing_info.socket_log_id;
++    }
++  }
+   load_timing_info_.send_start = base::TimeTicks::Now();
+   load_timing_info_.send_end = load_timing_info_.send_start;
+   delegate_->OnStreamReady(request_headers_sent);
+@@ -270,6 +279,8 @@ void BidirectionalStream::OnHeadersReceived(
+   if (has_load_timing) {
+     load_timing_info_.connect_timing = impl_load_timing_info.connect_timing;
+     load_timing_info_.socket_reused = impl_load_timing_info.socket_reused;
++    // Preserve socket_log_id alongside socket_reused when headers arrive.
++    load_timing_info_.socket_log_id = impl_load_timing_info.socket_log_id;
+   }
+   load_timing_info_.receive_headers_end = base::TimeTicks::Now();
+   read_end_time_ = load_timing_info_.receive_headers_end;
