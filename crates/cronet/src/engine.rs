@@ -4,7 +4,7 @@
 use std::{
     cell::Cell,
     ffi::{CStr, c_char, c_void},
-    fmt, mem,
+    fmt, io, mem,
     net::{IpAddr, SocketAddr},
     path::Path,
     ptr::{self, NonNull},
@@ -86,8 +86,41 @@ impl fmt::Debug for DialedUdpSocket {
     }
 }
 
+/// What a [stream dialer](EngineBuilder::stream_dialer) is asked to connect to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Target {
+    /// Destination hostname or IP literal.
+    pub host: String,
+    /// Destination TCP port.
+    pub port: u16,
+    /// Non-zero identifier unique to this transport connection, matching
+    /// [`Stream::connection_id`](crate::Stream::connection_id) and
+    /// [`BidirectionalConn::connection_id`](crate::BidirectionalConn::connection_id).
+    pub connection_id: u64,
+}
+
+/// Synthetic DNS and HTTPS/SVCB metadata registered for a host via
+/// [`Engine::endpoint`] or [`EngineBuilder::endpoint`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Endpoint {
+    /// Wire-encoded TLS `ECHConfigList` (`0xfe0d`), or empty for plain TLS.
+    pub ech: Vec<u8>,
+    /// ALPN protocol names to advertise (such as `["h2"]` or `["h3", "h2"]`);
+    /// empty uses Chrome's default (`["h2", "http/1.1"]`).
+    pub alpn: Vec<String>,
+    /// When `true`, ECH rejection fails immediately with
+    /// [`NetError::ECH_NOT_NEGOTIATED`] without unencrypted fallback or
+    /// `retry_configs` retry.
+    pub strict: bool,
+}
+
 type TcpDialer = dyn Fn(SocketAddr) -> Result<Socket, NetError> + Send + Sync;
 type UdpDialer = dyn Fn(SocketAddr) -> Result<DialedUdpSocket, NetError> + Send + Sync;
+#[cfg(feature = "tokio")]
+type StreamDialer = (
+    Box<dyn Fn(Target) -> io::Result<Box<dyn crate::Lower>> + Send + Sync>,
+    Option<tokio::runtime::Handle>,
+);
 type OnClose = Box<dyn FnOnce() + Send>;
 
 /// The dialers an engine calls back into; boxed twice so that the address
@@ -96,6 +129,8 @@ type OnClose = Box<dyn FnOnce() + Send>;
 struct Dialers {
     tcp: Option<Box<Box<TcpDialer>>>,
     udp: Option<Box<Box<UdpDialer>>>,
+    #[cfg(feature = "tokio")]
+    stream: Option<Box<StreamDialer>>,
 }
 
 /// An engine not started yet: the place for what must be set before
@@ -147,6 +182,94 @@ impl EngineBuilder {
         unsafe { sys::Cronet_Engine_SetUdpDialer(self.raw.as_ptr(), Some(dial_udp), context, Some(udp_socket_closed)) };
         self.dialers.udp = Some(dialer);
         self
+    }
+
+    /// Makes TCP connections over application-provided [`Lower`](crate::Lower)
+    /// byte streams instead of OS sockets.
+    ///
+    /// Takes precedence over [`dialer`](Self::dialer) for TCP while leaving
+    /// [`udp_dialer`](Self::udp_dialer) in place for QUIC, and automatically
+    /// enables the in-memory endpoint resolver so hostnames never query OS DNS.
+    #[cfg(feature = "tokio")]
+    #[must_use]
+    pub fn stream_dialer(
+        mut self,
+        dialer: impl Fn(Target) -> io::Result<Box<dyn crate::Lower>> + Send + Sync + 'static,
+    ) -> Self {
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let entry: Box<StreamDialer> = Box::new((Box::new(dialer), runtime));
+        let context = ptr::from_ref::<StreamDialer>(&entry).cast_mut().cast();
+        // SAFETY: the engine is not started; `entry` lives in `self.dialers.stream`
+        // until after the engine shuts down.
+        unsafe { sys::Cronet_Engine_SetStreamDialer(self.raw.as_ptr(), Some(dial_stream), context) };
+        self.dialers.stream = Some(entry);
+        self
+    }
+
+    /// Like [`stream_dialer`](Self::stream_dialer), for an asynchronous dial
+    /// function: the returned future is polled without blocking Cronet's
+    /// network thread.
+    #[cfg(feature = "tokio")]
+    #[must_use]
+    pub fn async_stream_dialer<F, Fut, S>(self, dialer: F) -> Self
+    where
+        F: Fn(Target) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = io::Result<S>> + Send + 'static,
+        S: crate::Lower,
+    {
+        self.stream_dialer(move |target| Ok(crate::lower::connecting(dialer(target))))
+    }
+
+    /// Registers synthetic DNS and HTTPS/SVCB metadata (`ECHConfigList`, ALPNs,
+    /// and strict ECH policy) for `host`, enabling the in-memory host resolver.
+    ///
+    /// # Panics
+    ///
+    /// If `host` or an ALPN entry contains a NUL byte.
+    #[must_use]
+    pub fn endpoint(self, host: &str, endpoint: Endpoint) -> Self {
+        set_endpoint_raw(self.raw.as_ptr(), host, &endpoint);
+        self
+    }
+
+    /// Enables the in-memory endpoint resolver before [`start`](Self::start)
+    /// even when endpoints will only be registered dynamically via
+    /// [`Engine::endpoint`] afterwards.
+    #[must_use]
+    pub fn enable_endpoints(self) -> Self {
+        // SAFETY: the engine is live.
+        unsafe { sys::Cronet_Engine_ClearEndpoints(self.raw.as_ptr()) };
+        self
+    }
+
+    /// Configures the engine with the unified [`tls::Config`](crate::tls::Config)
+    /// (exclusive root certificates, `verify_name`, certificate/SPKI SHA-256
+    /// pins, client certificate, strict ECH default, and clock offset).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if certificates, keys, or strings
+    /// in `config` fail validation.
+    pub fn tls_config(self, config: &crate::tls::Config) -> io::Result<Self> {
+        let raw_cfg = crate::tls::RawConfig::new(config)?;
+        let mut err_buf = [0 as c_char; 256];
+        // SAFETY: the engine is not started; `raw_cfg` outlives the call;
+        // `err_buf` is writable for `err_buf.len()` bytes.
+        let ok = unsafe {
+            sys::Cronet_Engine_ConfigureTls(self.raw.as_ptr(), raw_cfg.as_ptr(), err_buf.as_mut_ptr(), err_buf.len())
+        };
+        if !ok {
+            let msg = crate::tls::read_error_buf(&err_buf);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                if msg.is_empty() {
+                    "failed to configure engine TLS".to_owned()
+                } else {
+                    msg
+                },
+            ));
+        }
+        Ok(self)
     }
 
     /// Trusts only the certificates in `pem` (one or more) as roots.
@@ -355,6 +478,28 @@ impl Engine {
         unsafe { sys::Cronet_Engine_CloseAllConnections(self.as_ptr()) }
     }
 
+    /// Registers or updates synthetic endpoint metadata (`ECHConfigList`,
+    /// ALPNs, and strict ECH policy) for `host`.
+    ///
+    /// For engines started without [`EngineBuilder::stream_dialer`] or an
+    /// initial [`EngineBuilder::endpoint`], call
+    /// [`EngineBuilder::enable_endpoints`] before starting so the in-memory
+    /// resolver is installed.
+    ///
+    /// # Panics
+    ///
+    /// If `host` or an ALPN entry contains a NUL byte.
+    pub fn endpoint(&self, host: &str, endpoint: Endpoint) {
+        set_endpoint_raw(self.as_ptr(), host, &endpoint);
+    }
+
+    /// Clears all registered endpoint entries on this engine while keeping the
+    /// in-memory resolver active.
+    pub fn clear_endpoints(&self) {
+        // SAFETY: the engine is live.
+        unsafe { sys::Cronet_Engine_ClearEndpoints(self.as_ptr()) }
+    }
+
     pub(crate) fn as_ptr(&self) -> sys::Cronet_EnginePtr {
         self.0.raw.as_ptr()
     }
@@ -386,8 +531,66 @@ impl NetworkThread {
         Self(ON_NETWORK_THREAD.replace(true))
     }
 
-    fn is_current() -> bool {
+    pub(crate) fn is_current() -> bool {
         ON_NETWORK_THREAD.get()
+    }
+}
+
+fn set_endpoint_raw(engine: sys::Cronet_EnginePtr, host: &str, endpoint: &Endpoint) {
+    let host = c_string(host);
+    let alpn = if endpoint.alpn.is_empty() {
+        None
+    } else {
+        Some(c_string(&endpoint.alpn.join(",")))
+    };
+    let (ech_ptr, ech_len) = if endpoint.ech.is_empty() {
+        (ptr::null(), 0)
+    } else {
+        (endpoint.ech.as_ptr(), endpoint.ech.len())
+    };
+    // SAFETY: `engine` is live; all pointers remain valid for the duration of
+    // the call, which copies their contents.
+    unsafe {
+        sys::Cronet_Engine_SetEndpoint(
+            engine,
+            host.as_ptr(),
+            ech_ptr,
+            ech_len,
+            alpn.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+            endpoint.strict,
+        );
+    }
+}
+
+#[cfg(feature = "tokio")]
+unsafe extern "C" fn dial_stream(
+    context: *mut c_void,
+    host: *const c_char,
+    port: u16,
+    connection_id: u64,
+    handle: *mut sys::Cronet_LowerStreamHandle,
+    out_stream: *mut sys::Cronet_LowerStream,
+) -> std::ffi::c_int {
+    let _network = NetworkThread::enter();
+    // SAFETY: `context` points to the engine's `StreamDialer`, alive until shutdown.
+    let (dialer, runtime) = unsafe { &*context.cast::<StreamDialer>() };
+    let _rt = runtime.as_ref().map(tokio::runtime::Handle::enter);
+    // SAFETY: Cronet passes a valid NUL-terminated host string.
+    let host = unsafe { string(host) }.into_owned();
+    let target = Target {
+        host,
+        port,
+        connection_id,
+    };
+    match dialer(target) {
+        Ok(stream) => {
+            // SAFETY: `out_stream` is valid and `handle` transfers to `into_raw_stream` on success.
+            unsafe {
+                *out_stream = crate::lower::into_raw_stream(stream, handle, runtime.clone());
+            }
+            0
+        }
+        Err(error) => NetError::from_io_error(&error).code(),
     }
 }
 

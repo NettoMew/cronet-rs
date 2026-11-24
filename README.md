@@ -2,8 +2,11 @@
 
 Rust bindings to [Cronet], Chromium's network stack as a library, built from
 [naiveproxy]: Chrome's TLS, HTTP/2 and QUIC, its connection pooling and
-DNS, with naiveproxy's additions for embedding it in a proxy — custom TCP and
-UDP dialers, custom root certificates, and closing every connection on demand.
+DNS, with additions for embedding it in custom transports — TCP/UDP socket and
+in-memory byte-stream dialers, synthetic HTTPS/ECH endpoint registration,
+unified TLS verification (exclusive roots, `verify_name`, SHA-256 pins, client
+certificates), standalone TLS client streams on the engine's network thread,
+and closing every connection on demand.
 
 | crate | what it is |
 |---|---|
@@ -21,7 +24,7 @@ cronet = { git = "https://github.com/NettoMew/cronet-rs", features = ["tokio", "
 | feature | adds |
 |---|---|
 | `dynamic` | Opens libcronet at run time instead of linking it, unless `CRONET_LINK_KIND` asks for it linked. |
-| `tokio` | `BidirectionalConn`: a stream as `tokio::io::AsyncRead + AsyncWrite`. |
+| `tokio` | `BidirectionalConn`, byte-stream dialers (`EngineBuilder::stream_dialer` / `async_stream_dialer` over `Lower`), and `cronet::tls::TlsStream` (`tokio::io::AsyncRead + AsyncWrite`). |
 | `http` | `cronet::http::Client`: requests and responses as `http::Request` / `http::Response`, runtime-agnostic. |
 
 An HTTP request:
@@ -54,6 +57,35 @@ tunnel.start(
 )?;
 assert_eq!(tunnel.headers().await?.status(), Some(200));
 // `tunnel` is now an AsyncRead + AsyncWrite byte stream.
+```
+
+HTTP/2 or standalone TLS over any `AsyncRead + AsyncWrite` byte stream (without
+Chromium owning an OS socket), with synthetic ECH endpoint metadata:
+
+```rust
+use cronet::{Endpoint, Engine, EngineParams, Lower, tls};
+
+let tls_cfg = tls::Config {
+    root_certificates_pem: Some(ca_pem),
+    ..tls::Config::default()
+};
+let engine = Engine::builder()
+    .tls_config(&tls_cfg)?
+    .endpoint("service.example", Endpoint {
+        ech: ech_config_list,
+        alpn: vec!["h2".into()],
+        strict: true,
+    })
+    .stream_dialer(|target| -> std::io::Result<Box<dyn Lower>> {
+        // Return any AsyncRead + AsyncWrite + Send + Unpin + 'static stream;
+        // `target.connection_id` matches `Stream::connection_id()`.
+        todo!("dial {}:{}", target.host, target.port)
+    })
+    .start(&EngineParams::new())?;
+
+// Standalone TLS client sharing the engine's network thread and TLS fingerprint:
+let tls_client = tls::Client::new(&engine, tls_cfg)?;
+let tls_stream = tls_client.connect("service.example", lower_stream).await?;
 ```
 
 Underneath, everything Cronet's C API offers is there: `UrlRequest` with a

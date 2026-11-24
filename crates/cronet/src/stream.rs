@@ -10,7 +10,10 @@ use std::{
     ops::Deref,
     ptr::{self, NonNull},
     slice,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use bytes::{Bytes, BytesMut};
@@ -114,6 +117,7 @@ pub struct BidirectionalStream(Arc<Stream>);
 pub struct Stream {
     raw: NonNull<sys::bidirectional_stream>,
     state: Mutex<State>,
+    connection_id: AtomicU64,
     callback: Mutex<Box<dyn StreamCallback>>,
     _engine: Engine,
 }
@@ -173,6 +177,7 @@ impl BidirectionalStream {
             Stream {
                 raw: NonNull::new(raw).expect("bidirectional_stream_create returned null"),
                 state: Mutex::default(),
+                connection_id: AtomicU64::new(0),
                 callback: Mutex::new(Box::new(callback)),
                 _engine: engine.clone(),
             }
@@ -378,6 +383,27 @@ impl Stream {
         }
     }
 
+    /// Returns the non-zero [`Target::connection_id`](crate::Target::connection_id)
+    /// of the underlying transport connection when dialed via
+    /// [`EngineBuilder::stream_dialer`](crate::EngineBuilder::stream_dialer), or
+    /// `0` otherwise.
+    pub fn connection_id(&self) -> u64 {
+        let cached = self.connection_id.load(Ordering::Relaxed);
+        if cached != 0 {
+            return cached;
+        }
+        let state = self.state();
+        if state.phase != Phase::Started {
+            return 0;
+        }
+        // SAFETY: `self.raw` is live while `Phase::Started`.
+        let id = unsafe { sys::Cronet_BidirectionalStream_GetConnectionId(self.raw.as_ptr()) };
+        if id != 0 {
+            self.connection_id.store(id, Ordering::Relaxed);
+        }
+        id
+    }
+
     fn running(state: &State) -> Result<(), StreamError> {
         match state.phase {
             Phase::Started => Ok(()),
@@ -477,6 +503,7 @@ unsafe extern "C" fn on_stream_ready(raw: *mut sys::bidirectional_stream) {
     let _network = NetworkThread::enter();
     // SAFETY: called before the final callback.
     let stream = unsafe { stream(raw) };
+    let _ = stream.connection_id();
     stream.callback().on_stream_ready(stream);
 }
 
@@ -488,6 +515,7 @@ unsafe extern "C" fn on_response_headers_received(
     let _network = NetworkThread::enter();
     // SAFETY: called before the final callback, with headers valid for the call.
     let (stream, headers, protocol) = unsafe { (stream(raw), Headers::from_raw(headers), string(negotiated_protocol)) };
+    let _ = stream.connection_id();
     stream
         .callback()
         .on_response_headers_received(stream, &headers, &protocol);

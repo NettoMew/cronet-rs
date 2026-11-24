@@ -2,12 +2,16 @@
 //! [cronet-go].
 //!
 //! - [`Engine`]: the network stack, configured by [`EngineParams`], with
-//!   optional custom [TCP and UDP dialers](EngineBuilder).
+//!   optional custom [TCP/UDP socket or byte-stream dialers](EngineBuilder) and
+//!   synthetic [HTTPS/ECH endpoints](Endpoint).
 //! - [`UrlRequest`]: an HTTP request driven by a [`UrlRequestCallback`], with
 //!   bodies from an [`UploadDataProvider`].
 //! - [`BidirectionalStream`]: one HTTP/2 or QUIC stream, read and written at
 //!   once, reporting to a [`StreamCallback`].
 //! - `BidirectionalConn` (feature `tokio`): a stream as `AsyncRead + AsyncWrite`.
+//! - [`tls`]: standalone TLS client connections (`tls::Client` and
+//!   `tls::TlsStream`) running on an [`Engine`]'s network thread over any
+//!   [`Lower`] stream, sharing [`tls::Config`] with the engine.
 //! - [`http`] (feature `http`): requests as `http::Request` and `http::Response`.
 //!
 //! libcronet is linked, or with the feature `dynamic` loaded at run time; see
@@ -31,21 +35,26 @@ mod params;
 mod request;
 mod response;
 mod stream;
+pub mod tls;
 mod upload;
 
 #[cfg(feature = "tokio")]
 mod conn;
 #[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "tokio")]
+mod lower;
 
 pub use cronet_sys as sys;
 
 pub use buffer::{Buffer, BufferRef};
 #[cfg(feature = "tokio")]
 pub use conn::{BidirectionalConn, ConnOptions, ResponseHeaders};
-pub use engine::{DialedUdpSocket, Engine, EngineBuilder, Socket};
+pub use engine::{DialedUdpSocket, Endpoint, Engine, EngineBuilder, Socket, Target};
 pub use error::{ApiError, Error, ErrorCode, ErrorRef};
 pub use executor::{Executor, Runnable};
+#[cfg(feature = "tokio")]
+pub use lower::Lower;
 pub use metrics::{
     DateTime, DateTimeRef, FinishedReason, Metrics, MetricsRef, RequestFinishedInfo, RequestFinishedInfoRef,
     RequestFinishedListener,

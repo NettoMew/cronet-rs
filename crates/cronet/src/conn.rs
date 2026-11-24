@@ -245,6 +245,13 @@ impl BidirectionalConn {
         &self.stream
     }
 
+    /// The [`Target::connection_id`](crate::Target::connection_id) of the
+    /// transport connection carrying this stream, or `0` if not dialed via
+    /// [`EngineBuilder::stream_dialer`](crate::EngineBuilder::stream_dialer).
+    pub fn connection_id(&self) -> u64 {
+        self.stream.connection_id()
+    }
+
     /// Waits for the response headers.
     ///
     /// # Errors

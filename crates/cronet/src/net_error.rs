@@ -83,6 +83,13 @@ impl NetError {
         if let Some(net_error) = error.get_ref().and_then(|inner| inner.downcast_ref::<Self>()) {
             return *net_error;
         }
+        #[cfg(feature = "tokio")]
+        if let Some(handshake) = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<crate::tls::HandshakeError>())
+        {
+            return handshake.error;
+        }
         match error.kind() {
             io::ErrorKind::TimedOut => Self::CONNECTION_TIMED_OUT,
             io::ErrorKind::ConnectionRefused => Self::CONNECTION_REFUSED,
