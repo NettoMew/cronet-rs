@@ -1,4 +1,5 @@
 * text=auto eol=lf
+*.patch text eol=lf
 *.dll binary
 *.so binary
 *.a binary

@@ -60,9 +60,20 @@ fn apply_in(patches_root: &Path, naive_root: &Path, commit: &str) -> Result<()> 
 
     // Reset tracked files to the clean locked commit while keeping untracked
     // toolchains, sysroots, PGO profiles, and Ninja build outputs intact.
-    run(Command::new("git")
-        .current_dir(naive_root)
-        .args(["checkout", "--quiet", "--force", commit, "--", "."]))
+    // Override `core.autocrlf` and `core.eol` so Windows hosts with global
+    // `core.autocrlf=true` never materialize CRLF working-tree files.
+    run(Command::new("git").current_dir(naive_root).args([
+        "-c",
+        "core.autocrlf=false",
+        "-c",
+        "core.eol=lf",
+        "checkout",
+        "--quiet",
+        "--force",
+        commit,
+        "--",
+        ".",
+    ]))
     .with_context(|| format!("resetting naiveproxy {commit} before applying patches"))?;
 
     if patches.is_empty() && overlays.is_empty() {
@@ -81,7 +92,7 @@ fn apply_in(patches_root: &Path, naive_root: &Path, commit: &str) -> Result<()> 
         eprintln!("[xtask] applying patch {name}");
         let status = Command::new("git")
             .current_dir(naive_root)
-            .args(["apply", "--whitespace=nowarn"])
+            .args(["-c", "core.autocrlf=false", "apply", "--whitespace=nowarn"])
             .arg(patch)
             .status()
             .with_context(|| format!("starting git apply for {name} on naiveproxy {commit}"))?;
@@ -318,8 +329,17 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let naive = dir.join("naiveproxy");
         fs::create_dir_all(naive.join("src")).unwrap();
+        fs::write(naive.join(".gitattributes"), "* text=auto eol=lf\n").unwrap();
         fs::write(naive.join("src/hello.txt"), "line1\nline2\n").unwrap();
         run(Command::new("git").current_dir(&naive).args(["init", "--quiet"])).unwrap();
+        run(Command::new("git")
+            .current_dir(&naive)
+            .args(["config", "--local", "core.autocrlf", "false"]))
+        .unwrap();
+        run(Command::new("git")
+            .current_dir(&naive)
+            .args(["config", "--local", "core.eol", "lf"]))
+        .unwrap();
         run(Command::new("git")
             .current_dir(&naive)
             .args(["-c", "user.name=t", "-c", "user.email=t@t", "add", "."]))
@@ -448,5 +468,81 @@ mod tests {
         assert!(err.contains("0001-broken.patch"), "{err}");
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn applies_patches_with_lf_even_when_repo_config_requests_crlf() {
+        let dir = std::env::temp_dir().join(format!("xtask-patches-crlf-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let naive = dir.join("naiveproxy");
+        let patches = dir.join("patches");
+        fs::create_dir_all(naive.join("src")).unwrap();
+        fs::create_dir_all(&patches).unwrap();
+
+        run(Command::new("git").current_dir(&naive).args(["init", "--quiet"])).unwrap();
+        // Simulate a Windows runner with `core.autocrlf=true` and `core.eol=crlf`
+        // and no `.gitattributes` in the upstream checkout.
+        run(Command::new("git")
+            .current_dir(&naive)
+            .args(["config", "--local", "core.autocrlf", "true"]))
+        .unwrap();
+        run(Command::new("git")
+            .current_dir(&naive)
+            .args(["config", "--local", "core.eol", "crlf"]))
+        .unwrap();
+        fs::write(naive.join("src/hello.txt"), "line1\nline2\n").unwrap();
+        run(Command::new("git")
+            .current_dir(&naive)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "add", "."]))
+        .unwrap();
+        run(Command::new("git").current_dir(&naive).args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--quiet",
+            "-m",
+            "init",
+        ]))
+        .unwrap();
+        let commit = output(Command::new("git").current_dir(&naive).args(["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        // Remove the working-tree file so `git checkout --force` must materialize
+        // it from the object database.
+        fs::remove_file(naive.join("src/hello.txt")).unwrap();
+
+        fs::write(
+            patches.join("0001-first.patch"),
+            "--- a/src/hello.txt\n+++ b/src/hello.txt\n@@ -1,2 +1,2 @@\n-line1\n+first\n line2\n",
+        )
+        .unwrap();
+        apply_in(&patches, &naive, &commit).unwrap();
+        assert_eq!(fs::read(naive.join("src/hello.txt")).unwrap(), b"first\nline2\n");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn workspace_patches_and_overlays_use_lf_line_endings() {
+        let root = Workspace::locate().patches_root();
+        for patch in list_patches(&root).unwrap() {
+            let bytes = fs::read(&patch).unwrap();
+            assert!(
+                !bytes.contains(&b'\r'),
+                "{} contains CR bytes; patches must use LF line endings",
+                patch.display()
+            );
+        }
+        for (_, overlay) in list_overlays(&root.join("src")).unwrap() {
+            let bytes = fs::read(&overlay).unwrap();
+            assert!(
+                !bytes.contains(&b'\r'),
+                "{} contains CR bytes; overlay sources must use LF line endings",
+                overlay.display()
+            );
+        }
     }
 }

@@ -382,15 +382,40 @@ fn stays_global_apple(symbol: &str) -> bool {
     name.starts_with("Cronet_") || name.starts_with("bidirectional_stream_")
 }
 
-fn globals_apple(nm: &str) -> Vec<&str> {
-    let mut globals: Vec<&str> = nm
+/// Extracts defined, publicly visible (`external`, not `private external`)
+/// Mach-O global symbols from `xcrun nm -gU -m` output.
+///
+/// Mach-O sets `N_EXT` on both exported (`external`) and hidden
+/// (`private external`, `N_PEXT`) symbols, so `nm -gU -j` includes hidden C++
+/// helpers (such as non-`CRONET_EXPORT` `Cronet_Metrics_*_move` methods) that
+/// `ld -r -exported_symbols_list` rejects with `cannot export hidden symbol`.
+fn globals_apple(nm_macho: &str) -> Vec<&str> {
+    let mut globals: Vec<&str> = nm_macho
         .lines()
-        .map(str::trim)
+        .filter_map(visible_external_apple)
         .filter(|symbol| stays_global_apple(symbol))
         .collect();
     globals.sort_unstable();
     globals.dedup();
     globals
+}
+
+fn visible_external_apple(line: &str) -> Option<&str> {
+    let line = line.trim();
+    if line.is_empty() || line.ends_with(':') {
+        return None;
+    }
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    let [addr, section, middle @ .., symbol] = tokens.as_slice() else {
+        return None;
+    };
+    if middle.is_empty() || !addr.bytes().all(|b| b.is_ascii_hexdigit()) || !section.starts_with('(') {
+        return None;
+    }
+    if !middle.contains(&"external") || middle.contains(&"private") || middle.contains(&"non-external") {
+        return None;
+    }
+    Some(symbol)
 }
 
 /// Parses `otool -l`'s `LC_BUILD_VERSION` block into `(platform, minos, sdk)`
@@ -475,11 +500,6 @@ fn prelink_apple(target: &Target, archive: &Path, scratch: &Path, to: &Path) -> 
         Some("x64") => "x86_64",
         other => bail!("unsupported Apple target_cpu {other:?} for {target}"),
     };
-    let defined = output(Command::new("xcrun").args(["nm", "-gU", "-j"]).arg(archive))?;
-    let globals = globals_apple(&defined);
-    if !globals.iter().any(|symbol| symbol.starts_with("_Cronet_")) {
-        bail!("{} defines none of Cronet's C API", archive.display());
-    }
 
     let input = scratch.join("libcronet_input.a");
     copy(archive, &input)?;
@@ -496,6 +516,13 @@ fn prelink_apple(target: &Target, archive: &Path, scratch: &Path, to: &Path) -> 
             .args(["ar", "d"])
             .arg(&input)
             .arg("cxa_personality.o"))?;
+    }
+
+    let defined = output(Command::new("xcrun").args(["nm", "-gU", "-m"]).arg(&input))?;
+    let globals = globals_apple(&defined);
+    if !globals.iter().any(|symbol| symbol.starts_with("_Cronet_")) {
+        let _ = fs::remove_file(&input);
+        bail!("{} defines none of Cronet's C API", archive.display());
     }
     // `base/apple/call_with_eh_frame_asm.S` is a single-function hand-written
     // assembly stub that omits `.subsections_via_symbols`. Even one input
@@ -516,10 +543,7 @@ fn prelink_apple(target: &Target, archive: &Path, scratch: &Path, to: &Path) -> 
         enable_macho_subsections_via_symbols(&mut asm_bytes)?;
         let asm_obj = scratch.join("call_with_eh_frame_asm.o");
         fs::write(&asm_obj, &asm_bytes)?;
-        let rep_res = run(Command::new("xcrun")
-            .args(["ar", "r"])
-            .arg(&input)
-            .arg(&asm_obj));
+        let rep_res = run(Command::new("xcrun").args(["ar", "r"]).arg(&input).arg(&asm_obj));
         let _ = fs::remove_file(&asm_obj);
         rep_res?;
     }
@@ -765,18 +789,30 @@ frameworks = -framework Foundation -framework Security
     fn apple_globals_and_build_version() {
         let nm = [
             "",
-            "libcronet_static.a(cronet_c.o):",
-            "_Cronet_Engine_Create",
-            "_bidirectional_stream_create",
-            "_SSL_new",
-            "_malloc",
-            "___gxx_personality_v0",
-            "_Cronet_Engine_Create",
+            "libcronet_input.a(cronet_c.o):",
+            "0000000000001d78 (__TEXT,__text) external _Cronet_Engine_Create",
+            "0000000000000010 (__TEXT,__text) external [no dead strip] _bidirectional_stream_create",
+            "0000000000000020 (__TEXT,__text) weak external _Cronet_Buffer_Create",
+            "0000000000000030 (__TEXT,__text) external [cold func] _Cronet_Error_message_get",
+            "0000000000002b04 (__TEXT,__text) private external _Cronet_Metrics_request_start_move",
+            "0000000000002c00 (__TEXT,__text) weak private external _Cronet_Metrics_dns_start_move",
+            "0000000000002d00 (__TEXT,__text) private external [cold func] _Cronet_Metrics_ssl_start_move",
+            "0000000000000100 (__TEXT,__text) non-external _Cronet_Internal_Helper",
+            "                 (undefined) external _Cronet_Undefined_Ref",
+            "0000000000000200 (__TEXT,__text) external _SSL_new",
+            "0000000000000300 (__TEXT,__text) external _malloc",
+            "0000000000000400 (__TEXT,__text) external ___gxx_personality_v0",
+            "0000000000001d78 (__TEXT,__text) external _Cronet_Engine_Create",
         ]
         .join("\n");
         assert_eq!(
             globals_apple(&nm),
-            ["_Cronet_Engine_Create", "_bidirectional_stream_create"]
+            [
+                "_Cronet_Buffer_Create",
+                "_Cronet_Engine_Create",
+                "_Cronet_Error_message_get",
+                "_bidirectional_stream_create",
+            ]
         );
 
         let macos_otool = "\
@@ -812,97 +848,151 @@ Load command 0
     #[cfg(target_os = "macos")]
     #[test]
     fn prelink_apple_hides_internal_symbols_and_drops_cxa_personality() {
-        let dir = std::env::temp_dir().join(format!("xtask-prelink-apple-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let cases = [
+            ("aarch64-apple-darwin", "macosx", "arm64-apple-macos13.0", "arm64"),
+            ("x86_64-apple-darwin", "macosx", "x86_64-apple-macos13.0", "x86_64"),
+            ("aarch64-apple-ios", "iphoneos", "arm64-apple-ios15.0", "arm64"),
+            (
+                "aarch64-apple-ios-sim",
+                "iphonesimulator",
+                "arm64-apple-ios15.0-simulator",
+                "arm64",
+            ),
+            (
+                "x86_64-apple-ios",
+                "iphonesimulator",
+                "x86_64-apple-ios15.0-simulator",
+                "x86_64",
+            ),
+            ("aarch64-apple-tvos", "appletvos", "arm64-apple-tvos15.0", "arm64"),
+            (
+                "aarch64-apple-tvos-sim",
+                "appletvsimulator",
+                "arm64-apple-tvos15.0-simulator",
+                "arm64",
+            ),
+            (
+                "x86_64-apple-tvos",
+                "appletvsimulator",
+                "x86_64-apple-tvos15.0-simulator",
+                "x86_64",
+            ),
+        ];
 
-        let target = Target::host().unwrap();
-        let clang_arch = match target.gn_arg("target_cpu") {
-            Some("arm64") => "arm64",
-            Some("x64") => "x86_64",
-            other => panic!("unexpected host cpu: {other:?}"),
-        };
+        for (triple, sdk_name, clang_target, clang_arch) in cases {
+            let sdk_out = Command::new("xcrun")
+                .args(["--sdk", sdk_name, "--show-sdk-path"])
+                .output()
+                .unwrap();
+            if !sdk_out.status.success() {
+                assert_ne!(sdk_name, "macosx", "macosx SDK must be available to test {triple}");
+                continue;
+            }
+            let sdk_path = String::from_utf8(sdk_out.stdout).unwrap().trim().to_owned();
 
-        fs::write(
-            dir.join("api.c"),
-            "int SSL_new(void);\nint asm_helper(void);\nint Cronet_Test_Entry(void) { return SSL_new() + asm_helper(); }\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.join("ssl.c"),
-            "extern int UnusedExternal(void);\nint SSL_new(void) { return 41; }\nint DeadUnreachable(void) { return UnusedExternal(); }\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.join("cxa_personality.c"),
-            "int __gxx_personality_v0(void) { return 0; }\n",
-        )
-        .unwrap();
-        // Assembly object deliberately omitting `.subsections_via_symbols`.
-        let asm_src = match clang_arch {
-            "arm64" => ".text\n.globl _asm_helper\n_asm_helper:\n  mov w0, #1\n  ret\n",
-            _ => ".text\n.globl _asm_helper\n_asm_helper:\n  movl $1, %eax\n  retq\n",
-        };
-        fs::write(dir.join("call_with_eh_frame_asm.s"), asm_src).unwrap();
+            let dir = std::env::temp_dir().join(format!("xtask-prelink-{triple}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
 
-        for (src, obj) in [
-            ("api.c", "api.o"),
-            ("ssl.c", "ssl.o"),
-            ("cxa_personality.c", "cxa_personality.o"),
-            ("call_with_eh_frame_asm.s", "call_with_eh_frame_asm.o"),
-        ] {
-            run(Command::new("xcrun")
-                .args(["clang", "-c", "-arch", clang_arch])
-                .arg(dir.join(src))
-                .arg("-o")
-                .arg(dir.join(obj)))
+            let target = Target::find(triple).unwrap();
+            fs::write(
+                dir.join("api.c"),
+                "int SSL_new(void);\nint asm_helper(void);\n__attribute__((visibility(\"default\"))) int Cronet_Test_Entry(void) { return SSL_new() + asm_helper(); }\n__attribute__((visibility(\"default\"), cold)) int Cronet_Test_Cold(void) { return 7; }\n__attribute__((visibility(\"hidden\"))) void Cronet_Metrics_request_start_move(void) {}\n",
+            )
             .unwrap();
+            fs::write(
+                dir.join("ssl.c"),
+                "extern int UnusedExternal(void);\nint SSL_new(void) { return 41; }\nint DeadUnreachable(void) { return UnusedExternal(); }\n",
+            )
+            .unwrap();
+            fs::write(
+                dir.join("cxa_personality.c"),
+                "int __gxx_personality_v0(void) { return 0; }\n",
+            )
+            .unwrap();
+            // Assembly object deliberately omitting `.subsections_via_symbols`.
+            let asm_src = match clang_arch {
+                "arm64" => ".text\n.globl _asm_helper\n_asm_helper:\n  mov w0, #1\n  ret\n",
+                _ => ".text\n.globl _asm_helper\n_asm_helper:\n  movl $1, %eax\n  retq\n",
+            };
+            fs::write(dir.join("call_with_eh_frame_asm.s"), asm_src).unwrap();
+
+            for (src, obj) in [
+                ("api.c", "api.o"),
+                ("ssl.c", "ssl.o"),
+                ("cxa_personality.c", "cxa_personality.o"),
+                ("call_with_eh_frame_asm.s", "call_with_eh_frame_asm.o"),
+            ] {
+                run(Command::new("xcrun")
+                    .args(["clang", "-c", "-target", clang_target, "-isysroot", &sdk_path])
+                    .arg(dir.join(src))
+                    .arg("-o")
+                    .arg(dir.join(obj)))
+                .unwrap();
+            }
+            assert!(
+                !macho_has_subsections_via_symbols(&fs::read(dir.join("call_with_eh_frame_asm.o")).unwrap()).unwrap(),
+                "test fixture for {triple} must exercise missing MH_SUBSECTIONS_VIA_SYMBOLS"
+            );
+
+            let raw = dir.join("libcronet_static.a");
+            run(Command::new("xcrun")
+                .args(["ar", "rcs"])
+                .arg(&raw)
+                .arg(dir.join("api.o"))
+                .arg(dir.join("ssl.o"))
+                .arg(dir.join("cxa_personality.o"))
+                .arg(dir.join("call_with_eh_frame_asm.o")))
+            .unwrap();
+
+            let out = dir.join("libcronet.a");
+            prelink_apple(target, &raw, &dir, &out).unwrap();
+
+            let globals_list = fs::read_to_string(dir.join("libcronet_globals.txt")).unwrap();
+            assert_eq!(
+                globals_list.lines().collect::<Vec<_>>(),
+                ["_Cronet_Test_Cold", "_Cronet_Test_Entry"],
+                "hidden Cronet_* helpers must not enter -exported_symbols_list or -u ({triple})"
+            );
+            let exported = output(Command::new("xcrun").args(["nm", "-gU", "-m"]).arg(&out)).unwrap();
+            assert_eq!(
+                globals_apple(&exported),
+                ["_Cronet_Test_Cold", "_Cronet_Test_Entry"],
+                "{triple}"
+            );
+            assert!(
+                !exported.contains("private external"),
+                "prelinked Mach-O archive for {triple} must not retain private external symbols: {exported}"
+            );
+
+            // Downstream `-dead_strip` must strip `DeadUnreachable` (and its
+            // unresolved `_UnusedExternal` reference) thanks to preserved
+            // `MH_SUBSECTIONS_VIA_SYMBOLS`.
+            fs::write(
+                dir.join("host.c"),
+                "int Cronet_Test_Entry(void);\n__attribute__((visibility(\"default\"))) int host_entry(void) { return Cronet_Test_Entry(); }\n",
+            )
+            .unwrap();
+            let dylib = dir.join("libhost.dylib");
+            run(Command::new("xcrun")
+                .args([
+                    "clang",
+                    "-dynamiclib",
+                    "-target",
+                    clang_target,
+                    "-isysroot",
+                    &sdk_path,
+                    "-Wl,-dead_strip",
+                ])
+                .arg(dir.join("host.c"))
+                .arg(&out)
+                .arg("-o")
+                .arg(&dylib))
+            .unwrap();
+            let undefs = output(Command::new("xcrun").args(["nm", "-u", "-j"]).arg(&dylib)).unwrap();
+            assert!(!undefs.lines().any(|l| l.trim() == "_UnusedExternal"), "{triple}");
+
+            let _ = fs::remove_dir_all(&dir);
         }
-        assert!(
-            !macho_has_subsections_via_symbols(&fs::read(dir.join("call_with_eh_frame_asm.o")).unwrap()).unwrap(),
-            "test fixture must exercise missing MH_SUBSECTIONS_VIA_SYMBOLS"
-        );
-
-        let raw = dir.join("libcronet_static.a");
-        run(Command::new("xcrun")
-            .args(["ar", "rcs"])
-            .arg(&raw)
-            .arg(dir.join("api.o"))
-            .arg(dir.join("ssl.o"))
-            .arg(dir.join("cxa_personality.o"))
-            .arg(dir.join("call_with_eh_frame_asm.o")))
-        .unwrap();
-
-        let out = dir.join("libcronet.a");
-        prelink_apple(target, &raw, &dir, &out).unwrap();
-
-        let exported = output(Command::new("xcrun").args(["nm", "-gU", "-j"]).arg(&out)).unwrap();
-        let syms: Vec<&str> = exported
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.ends_with(':'))
-            .collect();
-        assert_eq!(syms, ["_Cronet_Test_Entry"]);
-
-        // Downstream `-dead_strip` must strip `DeadUnreachable` (and its
-        // unresolved `_UnusedExternal` reference) thanks to preserved
-        // `MH_SUBSECTIONS_VIA_SYMBOLS`.
-        fs::write(
-            dir.join("host.c"),
-            "int Cronet_Test_Entry(void);\n__attribute__((visibility(\"default\"))) int host_entry(void) { return Cronet_Test_Entry(); }\n",
-        )
-        .unwrap();
-        let dylib = dir.join("libhost.dylib");
-        run(Command::new("xcrun")
-            .args(["clang", "-dynamiclib", "-arch", clang_arch, "-Wl,-dead_strip"])
-            .arg(dir.join("host.c"))
-            .arg(&out)
-            .arg("-o")
-            .arg(&dylib))
-        .unwrap();
-        let undefs = output(Command::new("xcrun").args(["nm", "-u", "-j"]).arg(&dylib)).unwrap();
-        assert!(!undefs.lines().any(|l| l.trim() == "_UnusedExternal"));
-
-        let _ = fs::remove_dir_all(&dir);
     }
 }

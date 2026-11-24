@@ -83,6 +83,10 @@ pub(crate) fn fetch(workspace: &Workspace) -> Result<()> {
         fs::create_dir_all(&root)?;
         run(git().args(["init", "--quiet"]))?;
     }
+    // Keep checked-out Chromium sources in LF on Windows (`core.autocrlf=true`
+    // runners) so `git apply` and LF overlays in `patches/` always match.
+    run(git().args(["config", "--local", "core.autocrlf", "false"]))?;
+    run(git().args(["config", "--local", "core.eol", "lf"]))?;
     let head = output(git().args(["rev-parse", "--verify", "--quiet", "HEAD"])).unwrap_or_default();
     if head.trim() != lock.commit {
         eprintln!(
