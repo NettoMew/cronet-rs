@@ -843,3 +843,158 @@ async fn tls_client_echoes_megabytes_and_verifies_roots_names_pins_and_mtls() {
     mtls_h2.read_to_end(&mut out).await.unwrap();
     assert_eq!(out, b"hello");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lower_stream_preserves_cross_direction_wake_on_ready_read() {
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+    use tokio::io::ReadBuf;
+
+    if !common::library() {
+        return;
+    }
+
+    // Simulates an early-data HTTP upgrade wrapper whose first `poll_write`
+    // sends the upgrade preface + early payload and returns `Poll::Pending`
+    // until the server's `200 OK` + first TLS record arrive together during
+    // `poll_read` (which wakes `write_waker` synchronously while returning
+    // `Poll::Ready(Ok(()))`).
+    struct EarlyUpgradeStream {
+        inner: tokio::io::DuplexStream,
+        stage: Stage,
+        write_waker: Option<Waker>,
+    }
+
+    enum Stage {
+        Idle,
+        WaitingUpgrade { owed: usize },
+        Upgraded { owed: usize },
+    }
+
+    impl tokio::io::AsyncRead for EarlyUpgradeStream {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            let this = &mut *self;
+            if let Stage::WaitingUpgrade { owed } = this.stage {
+                let mut marker = [0u8; 4];
+                let mut mbuf = ReadBuf::new(&mut marker);
+                match Pin::new(&mut this.inner).poll_read(cx, &mut mbuf) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(())) => {
+                        assert_eq!(mbuf.filled(), b"UPOK");
+                        this.stage = Stage::Upgraded { owed };
+                        if let Some(w) = this.write_waker.take() {
+                            w.wake();
+                        }
+                    }
+                }
+            } else if matches!(this.stage, Stage::Idle) {
+                return Poll::Pending;
+            }
+            Pin::new(&mut this.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for EarlyUpgradeStream {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            let this = &mut *self;
+            match this.stage {
+                Stage::Idle => match Pin::new(&mut this.inner).poll_write(cx, buf) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(n)) => {
+                        let _ = Pin::new(&mut this.inner).poll_flush(cx);
+                        this.write_waker = Some(cx.waker().clone());
+                        this.stage = Stage::WaitingUpgrade { owed: n };
+                        Poll::Pending
+                    }
+                },
+                Stage::WaitingUpgrade { .. } => {
+                    this.write_waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+                Stage::Upgraded { ref mut owed } if *owed > 0 => Poll::Ready(Ok(std::mem::take(owed))),
+                Stage::Upgraded { .. } => Pin::new(&mut this.inner).poll_write(cx, buf),
+            }
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    let pki = generate_pki("upgrade.example");
+    let acceptor = TlsAcceptor::from(Arc::new(pki.server_config));
+
+    let mut params = EngineParams::new();
+    params.set_enable_quic(false).set_enable_http2(true);
+    let engine = Engine::builder()
+        .tls_config(&tls::Config {
+            root_certificates_pem: Some(pki.ca_pem),
+            ..tls::Config::default()
+        })
+        .unwrap()
+        .stream_dialer(move |_| -> io::Result<Box<dyn Lower>> {
+            let (client_raw, mut server_raw) = tokio::io::duplex(64 * 1024);
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let (mut bridge_a, bridge_b) = tokio::io::duplex(64 * 1024);
+                serve_h2_stream(bridge_b, acceptor);
+                let mut first = vec![0u8; 8192];
+                let Ok(n) = server_raw.read(&mut first).await else {
+                    return;
+                };
+                if bridge_a.write_all(&first[..n]).await.is_err() {
+                    return;
+                }
+                // Wait until rustls produces ServerHello before sending `"UPOK"` +
+                // ServerHello in one coalesced burst so `poll_read` wakes `write_waker`
+                // and returns `Poll::Ready(Ok(()))` in the same call!
+                let mut srv_flight = vec![0u8; 8192];
+                let Ok(sn) = bridge_a.read(&mut srv_flight).await else {
+                    return;
+                };
+                let mut burst = Vec::with_capacity(4 + sn);
+                burst.extend_from_slice(b"UPOK");
+                burst.extend_from_slice(&srv_flight[..sn]);
+                if server_raw.write_all(&burst).await.is_err() {
+                    return;
+                }
+                let _ = tokio::io::copy_bidirectional(&mut server_raw, &mut bridge_a).await;
+            });
+            Ok(Box::new(EarlyUpgradeStream {
+                inner: client_raw,
+                stage: Stage::Idle,
+                write_waker: None,
+            }))
+        })
+        .start(&params)
+        .unwrap();
+
+    for i in 0..5 {
+        let mut conn = BidirectionalConn::new(&engine, ConnOptions::default());
+        conn.start(
+            "POST",
+            "https://upgrade.example/echo",
+            NO_HEADERS,
+            StreamPriority::Highest,
+            false,
+        )
+        .unwrap();
+        let payload = format!("upgrade-round-{i}").into_bytes();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            conn.write_all(&payload).await.unwrap();
+            conn.shutdown().await.unwrap();
+            assert_eq!(conn.headers().await.unwrap().status(), Some(200));
+            let mut echoed = Vec::new();
+            conn.read_to_end(&mut echoed).await.unwrap();
+            assert_eq!(echoed, payload);
+        })
+        .await
+        .expect("early-upgrade stream must not drop cross-direction WRITABLE wake");
+    }
+}

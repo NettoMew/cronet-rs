@@ -186,8 +186,14 @@ unsafe extern "C" fn lower_read(context: *mut c_void, buffer: *mut u8, capacity:
         loop {
             let mut read_buf = ReadBuf::new(slice);
             match Pin::new(&mut **stream).poll_read(&mut cx, &mut read_buf) {
-                Poll::Ready(Ok(())) => break Ok(read_buf.filled().len() as isize),
-                Poll::Ready(Err(error)) => break Err(NetError::from_io_error(&error)),
+                Poll::Ready(Ok(())) => {
+                    deferred_other |= guard.take_woke() & !READABLE;
+                    break Ok(read_buf.filled().len() as isize);
+                }
+                Poll::Ready(Err(error)) => {
+                    deferred_other |= guard.take_woke() & !READABLE;
+                    break Err(NetError::from_io_error(&error));
+                }
                 Poll::Pending => {
                     let woke = guard.take_woke();
                     deferred_other |= woke & !READABLE;
@@ -236,13 +242,19 @@ unsafe extern "C" fn lower_write(context: *mut c_void, data: *const u8, length: 
         let mut repolls = 0;
         loop {
             match Pin::new(&mut **stream).poll_write(&mut cx, slice) {
-                Poll::Ready(Ok(0)) => break Err(NetError::CONNECTION_CLOSED),
+                Poll::Ready(Ok(0)) => {
+                    deferred_other |= guard.take_woke() & !WRITABLE;
+                    break Err(NetError::CONNECTION_CLOSED);
+                }
                 Poll::Ready(Ok(written)) => {
                     let _ = Pin::new(&mut **stream).poll_flush(&mut cx);
-                    deferred_other |= guard.take_woke();
+                    deferred_other |= guard.take_woke() & !WRITABLE;
                     break Ok(written as isize);
                 }
-                Poll::Ready(Err(error)) => break Err(NetError::from_io_error(&error)),
+                Poll::Ready(Err(error)) => {
+                    deferred_other |= guard.take_woke() & !WRITABLE;
+                    break Err(NetError::from_io_error(&error));
+                }
                 Poll::Pending => {
                     let woke = guard.take_woke();
                     deferred_other |= woke & !WRITABLE;
