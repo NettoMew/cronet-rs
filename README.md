@@ -18,7 +18,7 @@ and closing every connection on demand.
 
 ```toml
 [dependencies]
-cronet = { git = "https://github.com/NettoMew/cronet-rs", features = ["tokio", "http"] }
+cronet = { git = "https://github.com/NettoMew/cronet-rs", tag = "v0.2.0", features = ["tokio", "http"] }
 ```
 
 | feature | adds |
@@ -59,33 +59,59 @@ assert_eq!(tunnel.headers().await?.status(), Some(200));
 // `tunnel` is now an AsyncRead + AsyncWrite byte stream.
 ```
 
-HTTP/2 or standalone TLS over any `AsyncRead + AsyncWrite` byte stream (without
-Chromium owning an OS socket), with synthetic ECH endpoint metadata:
+HTTP/2 streams over any `AsyncRead + AsyncWrite` byte stream (`Lower`, without
+Chromium owning an OS socket), with synthetic ECH endpoint metadata in strict
+mode:
 
 ```rust
-use cronet::{Endpoint, Engine, EngineParams, Lower, tls};
+use cronet::{BidirectionalConn, ConnOptions, Endpoint, Engine, EngineParams, StreamPriority, tls};
 
 let tls_cfg = tls::Config {
-    root_certificates_pem: Some(ca_pem),
+    root_certificates_pem: Some(ca_pem), // exclusive root set; ignores OS/Chrome roots
+    strict_ech: true,
     ..tls::Config::default()
 };
 let engine = Engine::builder()
     .tls_config(&tls_cfg)?
     .endpoint("service.example", Endpoint {
-        ech: ech_config_list,
-        alpn: vec!["h2".into()],
-        strict: true,
+        ech: ech_config_list.clone(),
+        alpn: vec!["h2".into(), "http/1.1".into()],
+        strict: true, // fail closed with ECH_NOT_NEGOTIATED; never retry without ECH
     })
-    .stream_dialer(|target| -> std::io::Result<Box<dyn Lower>> {
-        // Return any AsyncRead + AsyncWrite + Send + Unpin + 'static stream;
-        // `target.connection_id` matches `Stream::connection_id()`.
-        todo!("dial {}:{}", target.host, target.port)
+    .async_stream_dialer(|target| async move {
+        // Any `AsyncRead + AsyncWrite + Send + Unpin + 'static` stream works
+        // (TCP, custom userspace transports, tunnels, or in-memory pipes).
+        // `target.connection_id` matches `BidirectionalConn::connection_id()`.
+        tokio::net::TcpStream::connect(("proxy.example", target.port)).await
     })
     .start(&EngineParams::new())?;
 
-// Standalone TLS client sharing the engine's network thread and TLS fingerprint:
-let tls_client = tls::Client::new(&engine, tls_cfg)?;
-let tls_stream = tls_client.connect("service.example", lower_stream).await?;
+// Endpoints can also be added or rotated dynamically on a running engine:
+engine.endpoint("alt.example", Endpoint {
+    ech: ech_config_list.clone(),
+    alpn: vec!["h2".into()],
+    strict: true,
+});
+
+let mut stream = BidirectionalConn::new(&engine, ConnOptions::default());
+stream.start("POST", "https://service.example/v1/stream", &[], StreamPriority::Medium, false)?;
+let headers = stream.headers().await?;
+println!("status={:?} conn_id={}", headers.status(), stream.connection_id());
+```
+
+Standalone TLS client (`cronet::tls::Client`) sharing an engine's network thread
+and Chromium's `SSLClientSocket` handshake over caller-supplied streams:
+
+```rust
+use cronet::tls;
+
+let tls_client = tls::Client::new(&engine, &tls_cfg)?;
+let mut tls_stream = tls_client
+    .connect_with("service.example", 8443, Some(&ech_config_list), lower_stream)
+    .await?;
+assert!(tls_stream.ech_accepted());
+assert_eq!(tls_stream.alpn(), Some("h2"));
+// `tls_stream` implements `tokio::io::AsyncRead + AsyncWrite`.
 ```
 
 Underneath, everything Cronet's C API offers is there: `UrlRequest` with a
@@ -125,9 +151,9 @@ Then either:
   settings. Without `CRONET_LIB_DIR`, `cronet` is linked from the linker's
   own path.
 
-  On Linux and Android, `libcronet.a` is one prelinked object that keeps
-  Chromium to itself, as `libcronet.so` does: only Cronet's C API is global
-  in it (and, where Chromium's allocator is built in, the allocation
+  On Linux, Android, and Apple platforms, `libcronet.a` is prelinked so that it
+  keeps Chromium to itself, as `libcronet.so` does: only Cronet's C API is
+  global in it (and, where Chromium's allocator is built in, the allocation
   functions it replaces), so its BoringSSL and libc++ link beside any other
   copy of theirs, such as `boring`'s or `openssl`'s.
 
