@@ -31,7 +31,10 @@
   step on Linux and Android), localizing bundled BoringSSL and libc++ symbols
   while preserving `MH_SUBSECTIONS_VIA_SYMBOLS` for `-dead_strip` so `libcronet.a`
   links cleanly alongside external BoringSSL or OpenSSL crates with only
-  `Cronet_*` and `bidirectional_stream_*` symbols global.
+  `Cronet_*` and `bidirectional_stream_*` symbols global. Hand-written Apple
+  assembly sources that omitted `.subsections_via_symbols` now emit it on both
+  `arm64` and `x86_64`, and `cargo xtask package` verifies every input `.o`
+  member carries `MH_SUBSECTIONS_VIA_SYMBOLS` before `ld -r`.
 - **Patch layer in `xtask`**: `cargo xtask fetch` and `cargo xtask upgrade`
   apply `patches/*.patch` in lexical order and overlay `patches/src/` onto the
   checked-out `naiveproxy` tree, failing immediately with the locked naiveproxy

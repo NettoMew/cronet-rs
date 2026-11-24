@@ -467,8 +467,8 @@ const MH_MAGIC_64: u32 = 0xfeed_facf;
 const MH_OBJECT: u32 = 0x1;
 const MH_SUBSECTIONS_VIA_SYMBOLS: u32 = 0x2000;
 
-/// Sets `MH_SUBSECTIONS_VIA_SYMBOLS` on a 64-bit Mach-O `MH_OBJECT` header, or
-/// verifies whether it is already set.
+/// Returns whether `MH_SUBSECTIONS_VIA_SYMBOLS` is set on a 64-bit Mach-O
+/// `MH_OBJECT` header.
 fn macho_has_subsections_via_symbols(bytes: &[u8]) -> Result<bool> {
     if bytes.len() < 32 {
         bail!("Mach-O object header truncated ({} bytes)", bytes.len());
@@ -482,10 +482,117 @@ fn macho_has_subsections_via_symbols(bytes: &[u8]) -> Result<bool> {
     Ok((flags & MH_SUBSECTIONS_VIA_SYMBOLS) != 0)
 }
 
-fn enable_macho_subsections_via_symbols(bytes: &mut [u8]) -> Result<()> {
-    if !macho_has_subsections_via_symbols(bytes)? {
-        let flags = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
-        bytes[24..28].copy_from_slice(&(flags | MH_SUBSECTIONS_VIA_SYMBOLS).to_le_bytes());
+/// Verifies in a single pass over `archive_file` that every `.o` member carries
+/// `MH_SUBSECTIONS_VIA_SYMBOLS`, returning an error naming all members that
+/// omit it.
+///
+/// Even one input object without `MH_SUBSECTIONS_VIA_SYMBOLS` causes Apple's
+/// `ld -r` to clear that flag on the entire merged relocatable object,
+/// preventing `-dead_strip` in downstream builds from stripping unreachable
+/// code.
+fn verify_macho_archive_subsections_via_symbols(archive_label: &Path, archive_file: &Path) -> Result<()> {
+    let bytes = fs::read(archive_file).with_context(|| format!("reading {}", archive_file.display()))?;
+    if !bytes.starts_with(b"!<arch>\n") {
+        bail!("{} is not a standard `ar` archive", archive_label.display());
+    }
+
+    let mut offset = 8usize;
+    let mut gnu_strtab: &[u8] = &[];
+    let mut missing = Vec::new();
+    let mut checked = 0usize;
+
+    while offset < bytes.len() {
+        if offset % 2 == 1 {
+            offset += 1;
+            if offset >= bytes.len() {
+                break;
+            }
+        }
+        if bytes.len() - offset < 60 {
+            bail!(
+                "truncated `ar` member header at offset {offset} in {}",
+                archive_label.display()
+            );
+        }
+        let header = &bytes[offset..offset + 60];
+        if &header[58..60] != b"`\n" {
+            bail!(
+                "invalid `ar` member header magic at offset {offset} in {}",
+                archive_label.display()
+            );
+        }
+        let raw_name = std::str::from_utf8(&header[0..16])
+            .context("non-UTF-8 `ar` member name")?
+            .trim_end_matches(' ');
+        let size: usize = std::str::from_utf8(&header[48..58])
+            .context("non-UTF-8 `ar` member size")?
+            .trim()
+            .parse()
+            .context("invalid `ar` member size")?;
+        offset += 60;
+        if bytes.len() - offset < size {
+            bail!(
+                "truncated `ar` member payload ({size} bytes) in {}",
+                archive_label.display()
+            );
+        }
+        let payload = &bytes[offset..offset + size];
+        offset += size;
+
+        if raw_name == "//" {
+            gnu_strtab = payload;
+            continue;
+        }
+        let (name, obj_bytes) = if let Some(ext_len) = raw_name.strip_prefix("#1/") {
+            let name_len: usize = ext_len.parse().context("invalid BSD `#1/` extended name length")?;
+            if payload.len() < name_len {
+                bail!(
+                    "BSD `#1/{name_len}` name exceeds member size in {}",
+                    archive_label.display()
+                );
+            }
+            let name = String::from_utf8_lossy(&payload[..name_len])
+                .trim_end_matches('\0')
+                .to_owned();
+            (name, &payload[name_len..])
+        } else if let Some(off_str) = raw_name.strip_prefix('/')
+            && !off_str.is_empty()
+            && off_str.bytes().all(|b| b.is_ascii_digit())
+        {
+            let off: usize = off_str.parse().context("invalid GNU `ar` string table offset")?;
+            let tail = gnu_strtab
+                .get(off..)
+                .context("GNU `ar` string table offset out of bounds")?;
+            let end = tail
+                .iter()
+                .position(|&b| b == b'/' || b == b'\n' || b == 0)
+                .unwrap_or(tail.len());
+            (String::from_utf8_lossy(&tail[..end]).into_owned(), payload)
+        } else {
+            (raw_name.trim_end_matches('/').to_owned(), payload)
+        };
+
+        if name.is_empty() || name == "/" || name.starts_with("__.SYMDEF") {
+            continue;
+        }
+        checked += 1;
+        let has_flag = macho_has_subsections_via_symbols(obj_bytes)
+            .with_context(|| format!("inspecting Mach-O member `{name}` in {}", archive_label.display()))?;
+        if !has_flag {
+            missing.push(name);
+        }
+    }
+
+    if checked == 0 {
+        bail!("no object members found in Mach-O archive {}", archive_label.display());
+    }
+    if !missing.is_empty() {
+        bail!(
+            "{} has {} Mach-O member(s) without MH_SUBSECTIONS_VIA_SYMBOLS (would disable -dead_strip after `ld -r`): {}",
+            archive_label.display(),
+            missing.len(),
+            missing.join(", ")
+        );
     }
     Ok(())
 }
@@ -518,34 +625,16 @@ fn prelink_apple(target: &Target, archive: &Path, scratch: &Path, to: &Path) -> 
             .arg("cxa_personality.o"))?;
     }
 
+    if let Err(err) = verify_macho_archive_subsections_via_symbols(archive, &input) {
+        let _ = fs::remove_file(&input);
+        return Err(err);
+    }
+
     let defined = output(Command::new("xcrun").args(["nm", "-gU", "-m"]).arg(&input))?;
     let globals = globals_apple(&defined);
     if !globals.iter().any(|symbol| symbol.starts_with("_Cronet_")) {
         let _ = fs::remove_file(&input);
         bail!("{} defines none of Cronet's C API", archive.display());
-    }
-    // `base/apple/call_with_eh_frame_asm.S` is a single-function hand-written
-    // assembly stub that omits `.subsections_via_symbols`. Even one input
-    // object without `MH_SUBSECTIONS_VIA_SYMBOLS` causes `ld -r` to clear that
-    // flag on the entire merged relocatable object, preventing `-dead_strip`
-    // in downstream builds from stripping unreachable code.
-    if members.lines().any(|line| line.trim() == "call_with_eh_frame_asm.o") {
-        let asm_out = Command::new("xcrun")
-            .args(["ar", "-p"])
-            .arg(&input)
-            .arg("call_with_eh_frame_asm.o")
-            .output()
-            .context("extracting call_with_eh_frame_asm.o")?;
-        if !asm_out.status.success() {
-            bail!("`xcrun ar -p call_with_eh_frame_asm.o` failed on {}", input.display());
-        }
-        let mut asm_bytes = asm_out.stdout;
-        enable_macho_subsections_via_symbols(&mut asm_bytes)?;
-        let asm_obj = scratch.join("call_with_eh_frame_asm.o");
-        fs::write(&asm_obj, &asm_bytes)?;
-        let rep_res = run(Command::new("xcrun").args(["ar", "r"]).arg(&input).arg(&asm_obj));
-        let _ = fs::remove_file(&asm_obj);
-        rep_res?;
     }
 
     let first_member = members
@@ -910,18 +999,32 @@ Load command 0
                 "int __gxx_personality_v0(void) { return 0; }\n",
             )
             .unwrap();
-            // Assembly object deliberately omitting `.subsections_via_symbols`.
-            let asm_src = match clang_arch {
-                "arm64" => ".text\n.globl _asm_helper\n_asm_helper:\n  mov w0, #1\n  ret\n",
-                _ => ".text\n.globl _asm_helper\n_asm_helper:\n  movl $1, %eax\n  retq\n",
+            // Assembly objects deliberately omitting `.subsections_via_symbols`
+            // (both >16-char BSD `#1/` extended name and short name) must be
+            // rejected by `prelink_apple` with every offending member named.
+            let asm_no_flag_a = match clang_arch {
+                "arm64" => ".text\n.globl _missing_a\n_missing_a:\n  mov w0, #1\n  ret\n",
+                _ => ".text\n.globl _missing_a\n_missing_a:\n  movl $1, %eax\n  retq\n",
             };
-            fs::write(dir.join("call_with_eh_frame_asm.s"), asm_src).unwrap();
+            let asm_no_flag_b = match clang_arch {
+                "arm64" => ".text\n.globl _missing_b\n_missing_b:\n  mov w0, #2\n  ret\n",
+                _ => ".text\n.globl _missing_b\n_missing_b:\n  movl $2, %eax\n  retq\n",
+            };
+            let asm_with_flag = match clang_arch {
+                "arm64" => ".text\n.globl _asm_helper\n_asm_helper:\n  mov w0, #1\n  ret\n.subsections_via_symbols\n",
+                _ => ".text\n.globl _asm_helper\n_asm_helper:\n  movl $1, %eax\n  retq\n.subsections_via_symbols\n",
+            };
+            fs::write(dir.join("missing_alpha_asm.s"), asm_no_flag_a).unwrap();
+            fs::write(dir.join("missing_b.s"), asm_no_flag_b).unwrap();
+            fs::write(dir.join("asm_helper.s"), asm_with_flag).unwrap();
 
             for (src, obj) in [
                 ("api.c", "api.o"),
                 ("ssl.c", "ssl.o"),
                 ("cxa_personality.c", "cxa_personality.o"),
-                ("call_with_eh_frame_asm.s", "call_with_eh_frame_asm.o"),
+                ("missing_alpha_asm.s", "missing_alpha_asm.o"),
+                ("missing_b.s", "missing_b.o"),
+                ("asm_helper.s", "asm_helper.o"),
             ] {
                 run(Command::new("xcrun")
                     .args(["clang", "-c", "-target", clang_target, "-isysroot", &sdk_path])
@@ -930,9 +1033,25 @@ Load command 0
                     .arg(dir.join(obj)))
                 .unwrap();
             }
+
+            let bad_raw = dir.join("libcronet_bad_static.a");
+            run(Command::new("xcrun")
+                .args(["ar", "rcs"])
+                .arg(&bad_raw)
+                .arg(dir.join("api.o"))
+                .arg(dir.join("ssl.o"))
+                .arg(dir.join("cxa_personality.o"))
+                .arg(dir.join("missing_alpha_asm.o"))
+                .arg(dir.join("missing_b.o")))
+            .unwrap();
+            let out = dir.join("libcronet.a");
+            let err = prelink_apple(target, &bad_raw, &dir, &out).unwrap_err().to_string();
             assert!(
-                !macho_has_subsections_via_symbols(&fs::read(dir.join("call_with_eh_frame_asm.o")).unwrap()).unwrap(),
-                "test fixture for {triple} must exercise missing MH_SUBSECTIONS_VIA_SYMBOLS"
+                err.contains("MH_SUBSECTIONS_VIA_SYMBOLS")
+                    && err.contains("missing_alpha_asm.o")
+                    && err.contains("missing_b.o")
+                    && !err.contains("api.o"),
+                "expected missing-flag error naming both members for {triple}, got: {err}"
             );
 
             let raw = dir.join("libcronet_static.a");
@@ -942,11 +1061,11 @@ Load command 0
                 .arg(dir.join("api.o"))
                 .arg(dir.join("ssl.o"))
                 .arg(dir.join("cxa_personality.o"))
-                .arg(dir.join("call_with_eh_frame_asm.o")))
+                .arg(dir.join("asm_helper.o")))
             .unwrap();
 
-            let out = dir.join("libcronet.a");
             prelink_apple(target, &raw, &dir, &out).unwrap();
+            verify_macho_archive_subsections_via_symbols(&out, &out).unwrap();
 
             let globals_list = fs::read_to_string(dir.join("libcronet_globals.txt")).unwrap();
             assert_eq!(

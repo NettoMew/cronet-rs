@@ -1,0 +1,24 @@
+diff --git a/src/base/apple/call_with_eh_frame_asm.S b/src/base/apple/call_with_eh_frame_asm.S
+index ee105503..4d0e76f9 100644
+--- a/src/base/apple/call_with_eh_frame_asm.S
++++ b/src/base/apple/call_with_eh_frame_asm.S
+@@ -140,3 +140,7 @@ Ltypes_table_base:
+   .p2align 2
+ 
+ #endif  // defined(__x86_64__) || defined(__aarch64__)
++
++#if defined(__APPLE__)
++  .subsections_via_symbols
++#endif
+diff --git a/src/third_party/zstd/src/lib/decompress/huf_decompress_amd64.S b/src/third_party/zstd/src/lib/decompress/huf_decompress_amd64.S
+index dc1f3d92..13fd5664 100644
+--- a/src/third_party/zstd/src/lib/decompress/huf_decompress_amd64.S
++++ b/src/third_party/zstd/src/lib/decompress/huf_decompress_amd64.S
+@@ -764,3 +764,7 @@ LOCAL_LABEL(4X2_exit):
+     .cfi_endproc
+ 
+ #endif
++
++#if defined(__APPLE__)
++.subsections_via_symbols
++#endif
