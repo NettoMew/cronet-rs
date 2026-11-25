@@ -17,13 +17,29 @@ use crate::Engine;
 /// Unified TLS verification, client-authentication, ALPN, and ECH settings.
 ///
 /// Used both to configure an [`Engine`](crate::EngineBuilder::tls_config) and
-/// to create a standalone [`Client`].
+/// to create a standalone [`Client`]. An engine ignores [`alpn`](Self::alpn)
+/// and [`ech`](Self::ech).
+///
+/// Verification, by what is set:
+///
+/// - nothing: Chromium's usual verification against the platform's roots;
+/// - [`root_certificates_pem`](Self::root_certificates_pem): the same, with
+///   only those roots;
+/// - [`verify_name`](Self::verify_name): the certificate is checked against
+///   that name instead of the host;
+/// - any pin: pins replace chain verification. A leaf whose certificate or
+///   SubjectPublicKeyInfo digest is pinned is accepted as is (no name,
+///   validity or chain check); a pinned intermediate becomes the only trust
+///   anchor for a chain checked as usual. `insecure` and
+///   `root_certificates_pem` are then ignored;
+/// - [`insecure`](Self::insecure) without pins: any certificate.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
     /// Skips server certificate verification when no pins are set.
     pub insecure: bool,
     /// Exclusive PEM root certificates: when set, only these roots are trusted
-    /// (never the platform store or Chrome's built-in root store).
+    /// (never the platform store or Chrome's built-in root store). Ignored
+    /// when pins are set.
     pub root_certificates_pem: Option<String>,
     /// Verifies the server certificate against this name while still sending
     /// the connection's target host as the TLS SNI.
@@ -35,15 +51,19 @@ pub struct Config {
     /// PEM client certificate chain and private key (PEM or PKCS#8 DER)
     /// offered when a server requests client authentication.
     pub client_identity: Option<(Vec<u8>, Vec<u8>)>,
-    /// ALPN protocol names to offer; empty offers Chrome's default
-    /// (`["h2", "http/1.1"]`).
+    /// ALPN protocol names a [`Client`] offers; empty offers Chrome's default
+    /// (`["h2", "http/1.1"]`). An engine takes ALPNs from
+    /// [`Endpoint::alpn`](crate::Endpoint::alpn) instead.
     pub alpn: Vec<String>,
     /// Default wire-encoded TLS `ECHConfigList` (`0xfe0d`) for connections
     /// made by a [`Client`] unless overridden per connection.
     pub ech: Vec<u8>,
     /// Rejects handshakes immediately with [`NetError::ECH_NOT_NEGOTIATED`](crate::NetError::ECH_NOT_NEGOTIATED)
     /// when ECH is not accepted, never retrying without ECH or accepting
-    /// server `retry_configs`.
+    /// server `retry_configs`. On an engine it applies to every host, on top
+    /// of each [`Endpoint::strict`](crate::Endpoint::strict). A [`Client`]
+    /// never retries by itself: without `strict_ech`, a rejected handshake
+    /// hands the server's retry configs to the caller (`HandshakeError`).
     pub strict_ech: bool,
     /// Offset in milliseconds added to the local clock during certificate
     /// validity verification.
@@ -138,7 +158,12 @@ pub(crate) fn read_error_buf(buf: &[c_char]) -> String {
 
 /// A TLS client running on an [`Engine`]'s network thread.
 ///
-/// Cloning is cheap; every [`TlsStream`] keeps its `Client` (and the underlying
+/// Each connection runs Chromium's `SSLClientSocket` over a caller-supplied
+/// `Lower` stream (feature `tokio`), sharing the engine's
+/// network thread with its requests and streams. The client may be used from
+/// any thread.
+///
+/// Cloning is cheap; every `TlsStream` keeps its `Client` (and the underlying
 /// [`Engine`]) alive until the connection closes on the network thread.
 #[derive(Clone)]
 pub struct Client(Arc<ClientInner>);
@@ -163,6 +188,9 @@ impl Drop for ClientInner {
 
 impl Client {
     /// Builds a TLS client on `engine` using `config`.
+    ///
+    /// Blocks until the engine's network thread has built the certificate
+    /// verifier (on that thread, it runs inline).
     ///
     /// # Errors
     ///
@@ -194,7 +222,8 @@ impl Client {
     }
 
     /// Updates the clock offset (in milliseconds) used when checking
-    /// certificate validity for subsequent handshakes.
+    /// certificate validity for subsequent handshakes; no effect with
+    /// [`Config::insecure`].
     pub fn set_time_offset(&self, offset_ms: i64) {
         // SAFETY: `self.0.raw` is live.
         unsafe { sys::Cronet_TlsClient_SetTimeOffset(self.0.raw.as_ptr(), offset_ms) };
@@ -202,6 +231,10 @@ impl Client {
 
     /// Performs a TLS handshake over `lower` to `host` (either `"example.com"`
     /// for port 443 or `"example.com:8443"`), using [`Config::ech`] when set.
+    ///
+    /// # Errors
+    ///
+    /// As [`connect_with`](Self::connect_with).
     #[cfg(feature = "tokio")]
     pub async fn connect(&self, host: &str, lower: impl crate::Lower) -> io::Result<TlsStream> {
         let (hostname, port) = split_host_port(host);
@@ -210,6 +243,42 @@ impl Client {
 
     /// Performs a TLS handshake over `lower` to `host:port`, overriding
     /// [`Config::ech`] when `ech` is `Some`.
+    ///
+    /// `host` is sent as SNI and, unless [`Config::verify_name`] says
+    /// otherwise, checked against the certificate; `port` (`0` meaning 443)
+    /// is the server's port as Chromium records it, while `lower` decides
+    /// where the bytes actually go. `lower` is polled on the network thread under
+    /// the same rules as a stream dialer's (see
+    /// [`EngineBuilder::stream_dialer`](crate::EngineBuilder::stream_dialer)),
+    /// with the Tokio runtime current at this call entered. Dropping the
+    /// future before it completes abandons the handshake and closes `lower`.
+    ///
+    /// ```no_run
+    /// # async fn example(engine: cronet::Engine, ech_config_list: Vec<u8>) -> std::io::Result<()> {
+    /// use cronet::tls;
+    /// use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    ///
+    /// let client = tls::Client::new(&engine, tls::Config {
+    ///     alpn: vec!["h2".into()],
+    ///     strict_ech: true,
+    ///     ..tls::Config::default()
+    /// })?;
+    /// let tcp = tokio::net::TcpStream::connect(("service.example.com", 443)).await?;
+    /// let mut tls = client.connect_with("service.example.com", 443, Some(&ech_config_list), tcp).await?;
+    /// assert!(tls.ech_accepted());
+    /// tls.write_all(b"ping").await?;
+    /// let mut reply = [0; 4];
+    /// tls.read_exact(&mut reply).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::InvalidInput`] if `host` contains a NUL byte or the
+    /// connection cannot be created. A failed handshake returns an error
+    /// wrapping a [`HandshakeError`] (see [`HandshakeError::from_io_error`]),
+    /// whose kind follows its [`NetError`](crate::NetError).
     #[cfg(feature = "tokio")]
     pub async fn connect_with(
         &self,
@@ -308,6 +377,14 @@ mod tokio_tls {
 
     /// An established TLS connection over a [`Lower`] stream, implementing
     /// `tokio::io::AsyncRead + AsyncWrite`.
+    ///
+    /// Reads and writes post to the engine's network thread, so the stream
+    /// works from any thread and runtime. One write is in flight at a time,
+    /// up to 64 KiB, and completes once the encrypted bytes have been handed
+    /// to the lower stream. [`poll_shutdown`](AsyncWrite::poll_shutdown)
+    /// waits for that write and refuses further ones, but sends no
+    /// `close_notify`; dropping the stream closes the connection and its
+    /// lower stream on the network thread.
     pub struct TlsStream {
         raw: NonNull<sys::Cronet_TlsConn>,
         shared: Arc<Shared>,

@@ -390,14 +390,18 @@ impl Stream {
     }
 
     /// Returns the transport `connection_id` carrying this stream:
-    /// - for TCP connections dialed via
-    ///   [`EngineBuilder::stream_dialer`](crate::EngineBuilder::stream_dialer),
-    ///   the non-zero [`Target::connection_id`](crate::Target::connection_id)
+    /// - for TCP connections dialed via a stream dialer
+    ///   (`EngineBuilder::stream_dialer`, feature `tokio`), the non-zero
+    ///   [`Target::connection_id`](crate::Target::connection_id)
     ///   (`(id & (1 << 63)) == 0`);
     /// - for QUIC / HTTP/3 sessions, `(1 << 63) | n`, shared by streams
     ///   multiplexed onto the same session and accepted by
     ///   [`Engine::set_quic_send_rate`](crate::Engine::set_quic_send_rate);
     /// - `0` for default OS-socket TCP connections or before the stream binds.
+    ///
+    /// The ID is known from [`on_stream_ready`](StreamCallback::on_stream_ready)
+    /// or [`on_response_headers_received`](StreamCallback::on_response_headers_received)
+    /// on, and is remembered after the stream ends.
     pub fn connection_id(&self) -> u64 {
         let cached = self.connection_id.load(Ordering::Relaxed);
         if cached != 0 {

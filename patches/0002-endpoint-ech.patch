@@ -147,10 +147,10 @@ index 228728ff..a0b97c13 100644
    intptr_t (*udp_dialer_)(void*,
                            const char*,
 diff --git a/src/components/cronet/native/include/cronet_c.h b/src/components/cronet/native/include/cronet_c.h
-index c7815d74..71e0e8e5 100644
+index 6d83582e..1d6ae52d 100644
 --- a/src/components/cronet/native/include/cronet_c.h
 +++ b/src/components/cronet/native/include/cronet_c.h
-@@ -171,6 +171,23 @@ CRONET_EXPORT void Cronet_LowerStreamHandle_Destroy(
+@@ -179,6 +179,33 @@ CRONET_EXPORT void Cronet_LowerStreamHandle_Destroy(
  CRONET_EXPORT uint64_t Cronet_BidirectionalStream_GetConnectionId(
      bidirectional_stream* stream);
  
@@ -159,6 +159,16 @@ index c7815d74..71e0e8e5 100644
 +// `host` on `engine`. May be called both before and after StartWithParams().
 +// Enabling any endpoint installs an in-memory HostResolver that never queries
 +// system or network DNS.
++// The resolver is installed by StartWithParams() when an endpoint was
++// registered (or Cronet_Engine_ClearEndpoints was called) before it, or a
++// stream dialer is set; on an engine started without it, endpoints
++// registered later have no effect. While it is installed, every hostname
++// resolves in memory to a synthetic address: a registered host with its
++// metadata, any other host without. Only a stream dialer maps the address
++// back to the hostname; socket dialers and QUIC see the synthetic address.
++// `strict_ech` makes a rejected ECH handshake fail with
++// ERR_ECH_NOT_NEGOTIATED, never retrying without ECH or with the server's
++// retry configs.
 +CRONET_EXPORT void Cronet_Engine_SetEndpoint(
 +    Cronet_EnginePtr engine,
 +    const char* host,

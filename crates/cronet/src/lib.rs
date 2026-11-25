@@ -11,13 +11,25 @@
 //! - `BidirectionalConn` (feature `tokio`): a stream as `AsyncRead + AsyncWrite`.
 //! - [`tls`]: standalone TLS client connections (`tls::Client` and
 //!   `tls::TlsStream`) running on an [`Engine`]'s network thread over any
-//!   [`Lower`] stream, sharing [`tls::Config`] with the engine.
-//! - [`http`] (feature `http`): requests as `http::Request` and `http::Response`.
+//!   `Lower` stream (feature `tokio`), sharing [`tls::Config`] with the
+//!   engine.
+//! - Stream dialers (feature `tokio`): Chromium's TCP connections over
+//!   `AsyncRead + AsyncWrite` streams the application provides, each with a
+//!   [`Target::connection_id`]; [`Endpoint`]s add ECH configurations and
+//!   ALPNs per host; [`Engine::set_quic_send_rate`] drives QUIC Brutal
+//!   congestion control per QUIC session.
+//! - `http` (feature `http`): requests as `http::Request` and `http::Response`.
 //!
 //! libcronet is linked, or with the feature `dynamic` loaded at run time; see
 //! [`cronet_sys`]. Everything here may be used from any thread. Callbacks run
 //! on Cronet's network thread or on an [`Executor`], and must not panic: a
 //! panic cannot unwind into Cronet, so it aborts the process.
+//!
+//! Dialers, `Lower` streams and callbacks that run on the network
+//! thread must not block it: it serves every request, stream and connection
+//! of the engine. Requests, streams, `tls::Client`s and their connections
+//! each keep their [`Engine`] alive; the engine shuts down when the last of
+//! them and its clones are gone.
 //!
 //! [naiveproxy]: https://github.com/klzgrad/naiveproxy
 //! [cronet-go]: https://github.com/SagerNet/cronet-go
@@ -44,6 +56,11 @@ mod conn;
 pub mod http;
 #[cfg(feature = "tokio")]
 mod lower;
+
+// The README's examples, compiled as doctests.
+#[cfg(all(doctest, feature = "tokio", feature = "http"))]
+#[doc = include_str!("../../../README.md")]
+mod readme {}
 
 pub use cronet_sys as sys;
 

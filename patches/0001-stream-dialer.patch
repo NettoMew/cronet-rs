@@ -109,7 +109,7 @@ index 7d005a65..228728ff 100644
    intptr_t (*udp_dialer_)(void*,
                            const char*,
 diff --git a/src/components/cronet/native/include/cronet_c.h b/src/components/cronet/native/include/cronet_c.h
-index 6bdec585..c7815d74 100644
+index 6bdec585..6d83582e 100644
 --- a/src/components/cronet/native/include/cronet_c.h
 +++ b/src/components/cronet/native/include/cronet_c.h
 @@ -5,6 +5,7 @@
@@ -128,7 +128,7 @@ index 6bdec585..c7815d74 100644
  
  // Additional Cronet C API not generated from cronet.idl.
  
-@@ -111,6 +113,64 @@ CRONET_EXPORT void Cronet_Engine_SetUdpDialer(
+@@ -111,6 +113,72 @@ CRONET_EXPORT void Cronet_Engine_SetUdpDialer(
  // Calls from Cronet's network thread schedule the close asynchronously.
  CRONET_EXPORT void Cronet_Engine_CloseAllConnections(Cronet_EnginePtr engine);
  
@@ -147,6 +147,10 @@ index 6bdec585..c7815d74 100644
 +// data is ready yet, or another negative Chromium net error code.
 +// `write` returns bytes written (> 0), -1 (ERR_IO_PENDING) when congested, or
 +// another negative Chromium net error code.
++// Cronet calls `read`, `write` and `close` on its network thread, one at a
++// time, and none of them may block. After ERR_IO_PENDING, Cronet tries again
++// once the embedder reports readiness with Cronet_LowerStreamHandle_Notify.
++// `close` runs once, after which neither `read` nor `write` is called.
 +typedef struct Cronet_LowerStream {
 +  void* context;
 +  intptr_t (*read)(void* context, uint8_t* buffer, size_t capacity);
@@ -159,6 +163,10 @@ index 6bdec585..c7815d74 100644
 +// with Cronet_LowerStreamHandle_Destroy after `close` runs) and populates
 +// `out_stream`. On failure (return a negative net error code), Cronet frees
 +// `handle`.
++// `host` is the hostname being connected to, or an IP literal.
++// `connection_id` is non-zero, unique within the process, and has its high
++// bit clear; Cronet_BidirectionalStream_GetConnectionId reports it for the
++// streams the connection carries. The callback must not block.
 +typedef int (*Cronet_StreamDialerFunc)(void* context,
 +                                       const char* host,
 +                                       uint16_t port,

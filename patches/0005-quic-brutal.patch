@@ -130,10 +130,10 @@ index c4af9e96..9cbe59fc 100644
                     const uint8_t* ech_config_list,
                     size_t ech_config_list_len,
 diff --git a/src/components/cronet/native/include/cronet_c.h b/src/components/cronet/native/include/cronet_c.h
-index 6ef81a2c..abc045c9 100644
+index 681b6dac..6f373f71 100644
 --- a/src/components/cronet/native/include/cronet_c.h
 +++ b/src/components/cronet/native/include/cronet_c.h
-@@ -166,8 +166,12 @@ CRONET_EXPORT void Cronet_LowerStreamHandle_Notify(
+@@ -174,8 +174,12 @@ CRONET_EXPORT void Cronet_LowerStreamHandle_Notify(
  CRONET_EXPORT void Cronet_LowerStreamHandle_Destroy(
      Cronet_LowerStreamHandle* handle);
  
@@ -148,8 +148,8 @@ index 6ef81a2c..abc045c9 100644
  CRONET_EXPORT uint64_t Cronet_BidirectionalStream_GetConnectionId(
      bidirectional_stream* stream);
  
-@@ -267,6 +271,16 @@ CRONET_EXPORT void Cronet_TlsConn_Write(Cronet_TlsConn* conn,
- 
+@@ -344,6 +348,19 @@ CRONET_EXPORT void Cronet_TlsConn_Write(Cronet_TlsConn* conn,
+ // not be used afterwards.
  CRONET_EXPORT void Cronet_TlsConn_Destroy(Cronet_TlsConn* conn);
  
 +// Sets or updates the QUIC Brutal send rate (in bytes per second) for the
@@ -158,6 +158,9 @@ index 6ef81a2c..abc045c9 100644
 +// `BRTL` client connection option. Passing `0` disables fixed-rate sending
 +// and falls back to BBR. Safe to call from any thread; unknown or closed
 +// `connection_id` values are ignored.
++// The call posts to the network thread and returns at once. The rate
++// shapes what this side sends on that session (all its streams), up to
++// 125,000,000,000 bytes per second; it does not limit what the peer sends.
 +CRONET_EXPORT void Cronet_Engine_SetQuicSendRate(Cronet_EnginePtr engine,
 +                                                 uint64_t connection_id,
 +                                                 uint64_t bytes_per_second);

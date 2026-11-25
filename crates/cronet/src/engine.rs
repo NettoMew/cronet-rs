@@ -86,21 +86,59 @@ impl fmt::Debug for DialedUdpSocket {
     }
 }
 
-/// What a [stream dialer](EngineBuilder::stream_dialer) is asked to connect to.
+/// What a stream dialer (`EngineBuilder::stream_dialer` or
+/// `EngineBuilder::async_stream_dialer`, feature `tokio`) is asked to
+/// connect to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Target {
-    /// Destination hostname or IP literal.
+    /// Destination hostname, as in the URL but lowercased, or an IP literal
+    /// when the URL names one. Never the synthetic address the engine's
+    /// in-memory resolver gave the host (see [`Endpoint`]).
     pub host: String,
     /// Destination TCP port.
     pub port: u16,
-    /// Non-zero identifier unique to this transport connection, matching
-    /// [`Stream::connection_id`](crate::Stream::connection_id) and
-    /// [`BidirectionalConn::connection_id`](crate::BidirectionalConn::connection_id).
+    /// Identifier of this transport connection: non-zero, unique within the
+    /// process (counting up from 1), with the high bit clear so it never
+    /// collides with a QUIC session's `(1 << 63) | n`. Streams carried by the
+    /// connection report it from
+    /// [`Stream::connection_id`](crate::Stream::connection_id).
     pub connection_id: u64,
 }
 
 /// Synthetic DNS and HTTPS/SVCB metadata registered for a host via
 /// [`Engine::endpoint`] or [`EngineBuilder::endpoint`].
+///
+/// Registering an endpoint (or calling [`EngineBuilder::enable_endpoints`],
+/// or setting a stream dialer) before [`start`](EngineBuilder::start)
+/// installs an in-memory resolver in place of DNS. From then on every
+/// hostname resolves in memory to a synthetic, unroutable address: a
+/// registered host with its metadata, any other host without. A stream
+/// dialer receives the hostname back in [`Target::host`]; the socket
+/// [`dialer`](EngineBuilder::dialer), the [`udp_dialer`](EngineBuilder::udp_dialer)
+/// and QUIC see only the synthetic address, so endpoints are meant for
+/// engines whose TCP connections go through a stream dialer.
+///
+/// ```no_run
+/// # fn example(ech_config_list: Vec<u8>) -> Result<(), cronet::ApiError> {
+/// use cronet::{Endpoint, Engine, EngineParams};
+///
+/// let engine = Engine::builder()
+///     .endpoint("service.example.com", Endpoint {
+///         ech: ech_config_list.clone(),
+///         alpn: vec!["h2".into()],
+///         strict: true,
+///     })
+///     .start(&EngineParams::new())?;
+///
+/// // Rotate the ECH configuration later, from any thread.
+/// engine.endpoint("service.example.com", Endpoint {
+///     ech: ech_config_list,
+///     alpn: vec!["h2".into()],
+///     strict: true,
+/// });
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Endpoint {
     /// Wire-encoded TLS `ECHConfigList` (`0xfe0d`), or empty for plain TLS.
@@ -110,7 +148,8 @@ pub struct Endpoint {
     pub alpn: Vec<String>,
     /// When `true`, ECH rejection fails immediately with
     /// [`NetError::ECH_NOT_NEGOTIATED`] without unencrypted fallback or
-    /// `retry_configs` retry.
+    /// `retry_configs` retry. [`tls::Config::strict_ech`](crate::tls::Config::strict_ech)
+    /// on the engine makes every host strict.
     pub strict: bool,
 }
 
@@ -189,7 +228,41 @@ impl EngineBuilder {
     ///
     /// Takes precedence over [`dialer`](Self::dialer) for TCP while leaving
     /// [`udp_dialer`](Self::udp_dialer) in place for QUIC, and automatically
-    /// enables the in-memory endpoint resolver so hostnames never query OS DNS.
+    /// enables the in-memory endpoint resolver so hostnames never query OS DNS
+    /// (see [`Endpoint`] for what that means for QUIC and the socket dialers).
+    ///
+    /// `dialer` is called on Cronet's network thread, once per connection,
+    /// with the [`Target`] to reach. It must return at once: for a connection
+    /// that takes time to establish, use
+    /// [`async_stream_dialer`](Self::async_stream_dialer), or return a stream
+    /// that connects as it is polled. An error fails the connection with the
+    /// [`NetError`] [`NetError::from_io_error`] maps it to.
+    ///
+    /// The returned stream is polled on the network thread too, never
+    /// concurrently with itself, so its `poll_*` methods must not block; its
+    /// wakers may be called from any thread. Cronet drops it when the
+    /// connection closes, after a best-effort `poll_shutdown`.
+    ///
+    /// The Tokio runtime current when this method is called, if any, is
+    /// entered around every dial and poll, so streams that need a reactor
+    /// (such as `tokio::net::TcpStream`) work. Call it inside the runtime,
+    /// and keep the runtime alive as long as the engine.
+    ///
+    /// ```no_run
+    /// # fn example() -> Result<(), cronet::ApiError> {
+    /// use cronet::{Engine, EngineParams, Lower};
+    ///
+    /// // A duplex pipe per connection; the other end would be served elsewhere.
+    /// let engine = Engine::builder()
+    ///     .stream_dialer(|target| {
+    ///         let (client, _server) = tokio::io::duplex(64 * 1024);
+    ///         println!("{}:{} is connection {}", target.host, target.port, target.connection_id);
+    ///         Ok(Box::new(client) as Box<dyn Lower>)
+    ///     })
+    ///     .start(&EngineParams::new())?;
+    /// # Ok(())
+    /// # }
+    /// ```
     #[cfg(feature = "tokio")]
     #[must_use]
     pub fn stream_dialer(
@@ -209,6 +282,27 @@ impl EngineBuilder {
     /// Like [`stream_dialer`](Self::stream_dialer), for an asynchronous dial
     /// function: the returned future is polled without blocking Cronet's
     /// network thread.
+    ///
+    /// `dialer` itself runs on the network thread and should only build the
+    /// future. The future is polled on the network thread when Cronet first
+    /// reads or writes, with the same runtime entered as for
+    /// [`stream_dialer`](Self::stream_dialer); an error from it fails the
+    /// connection.
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), cronet::ApiError> {
+    /// use cronet::{Engine, EngineParams};
+    ///
+    /// // Called inside the Tokio runtime that will drive the connections.
+    /// let engine = Engine::builder()
+    ///     .async_stream_dialer(|target| async move {
+    ///         // Every connection goes to one relay; `target` says where it is meant for.
+    ///         tokio::net::TcpStream::connect(("relay.example.com", 443)).await
+    ///     })
+    ///     .start(&EngineParams::new())?;
+    /// # Ok(())
+    /// # }
+    /// ```
     #[cfg(feature = "tokio")]
     #[must_use]
     pub fn async_stream_dialer<F, Fut, S>(self, dialer: F) -> Self
@@ -221,7 +315,9 @@ impl EngineBuilder {
     }
 
     /// Registers synthetic DNS and HTTPS/SVCB metadata (`ECHConfigList`, ALPNs,
-    /// and strict ECH policy) for `host`, enabling the in-memory host resolver.
+    /// and strict ECH policy) for `host`, enabling the in-memory host resolver
+    /// (see [`Endpoint`]). `host` matches case-insensitively; registering it
+    /// again replaces its entry.
     ///
     /// # Panics
     ///
@@ -234,7 +330,8 @@ impl EngineBuilder {
 
     /// Enables the in-memory endpoint resolver before [`start`](Self::start)
     /// even when endpoints will only be registered dynamically via
-    /// [`Engine::endpoint`] afterwards.
+    /// [`Engine::endpoint`] afterwards. Every hostname then resolves in memory;
+    /// see [`Endpoint`].
     #[must_use]
     pub fn enable_endpoints(self) -> Self {
         // SAFETY: the engine is live.
@@ -245,6 +342,28 @@ impl EngineBuilder {
     /// Configures the engine with the unified [`tls::Config`](crate::tls::Config)
     /// (exclusive root certificates, `verify_name`, certificate/SPKI SHA-256
     /// pins, client certificate, strict ECH default, and clock offset).
+    ///
+    /// The engine ignores [`alpn`](crate::tls::Config::alpn) and
+    /// [`ech`](crate::tls::Config::ech), which only a
+    /// [`tls::Client`](crate::tls::Client) uses; per-host ALPNs and ECH come
+    /// from [`Endpoint`]s. `strict_ech` applies to every host, and `verify_name`
+    /// to every server certificate. This replaces
+    /// [`trusted_root_certificates`](Self::trusted_root_certificates).
+    ///
+    /// ```no_run
+    /// # fn example(ca_pem: String) -> Result<(), Box<dyn std::error::Error>> {
+    /// use cronet::{Engine, EngineParams, tls};
+    ///
+    /// let engine = Engine::builder()
+    ///     .tls_config(&tls::Config {
+    ///         root_certificates_pem: Some(ca_pem),
+    ///         verify_name: Some("origin.example.com".into()),
+    ///         ..tls::Config::default()
+    ///     })?
+    ///     .start(&EngineParams::new())?;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
@@ -273,6 +392,10 @@ impl EngineBuilder {
     }
 
     /// Trusts only the certificates in `pem` (one or more) as roots.
+    ///
+    /// Ignored when [`tls_config`](Self::tls_config) is also used; set
+    /// [`root_certificates_pem`](crate::tls::Config::root_certificates_pem)
+    /// there instead.
     ///
     /// # Errors
     ///
@@ -479,12 +602,14 @@ impl Engine {
     }
 
     /// Registers or updates synthetic endpoint metadata (`ECHConfigList`,
-    /// ALPNs, and strict ECH policy) for `host`.
+    /// ALPNs, and strict ECH policy) for `host`. May be called from any
+    /// thread; connections made from then on use it.
     ///
-    /// For engines started without [`EngineBuilder::stream_dialer`] or an
-    /// initial [`EngineBuilder::endpoint`], call
-    /// [`EngineBuilder::enable_endpoints`] before starting so the in-memory
-    /// resolver is installed.
+    /// For engines started without a stream dialer
+    /// (`EngineBuilder::stream_dialer`, feature `tokio`) or an initial
+    /// [`EngineBuilder::endpoint`], call [`EngineBuilder::enable_endpoints`]
+    /// before starting so the in-memory resolver is installed; otherwise this
+    /// has no effect.
     ///
     /// # Panics
     ///
@@ -502,14 +627,46 @@ impl Engine {
 
     /// Sets or updates the QUIC Brutal send rate (in bytes per second) for the
     /// QUIC session identified by `connection_id` (from
-    /// [`Stream::connection_id`](crate::Stream::connection_id) or
-    /// [`BidirectionalConn::connection_id`](crate::BidirectionalConn::connection_id))
-    /// when the engine was started with the `BRTL` QUIC client connection
-    /// option (see [`EngineParamsRef::set_quic_options`]).
+    /// [`Stream::connection_id`](crate::Stream::connection_id), or
+    /// `BidirectionalConn::connection_id` with feature `tokio`) when the
+    /// engine was started with the `BRTL` QUIC client connection option (see
+    /// [`EngineParamsRef::set_quic_options`]).
     ///
     /// Passing `0` disables fixed-rate sending and delegates congestion control
     /// back to BBR. May be called from any thread; unknown or already closed
-    /// `connection_id` values are ignored.
+    /// `connection_id` values are ignored, as are TCP connection IDs (high bit
+    /// clear); sessions that did not select `BRTL` are unaffected.
+    ///
+    /// The call posts to the network thread and returns at once. The rate
+    /// applies to the whole session, every stream multiplexed onto it, and
+    /// survives connection migration. It shapes only what this side sends;
+    /// the peer's sending is up to the peer. With a rate set, the sender paces
+    /// at `rate / ack_rate`, where `ack_rate` is the share of packets
+    /// acknowledged over the last 5 seconds (counted once there are 50
+    /// samples, and never below 0.8, so at most 1.25 times the rate), and
+    /// keeps a congestion window of
+    /// `2 × paced rate × (max(srtt, 1 ms) + max(peer max_ack_delay, 25 ms))`,
+    /// at least 10 full-size packets. Rates above 125,000,000,000 bytes per second are
+    /// clamped.
+    ///
+    /// ```no_run
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// use cronet::{Engine, EngineParams, Stream};
+    ///
+    /// let mut params = EngineParams::new();
+    /// params.set_enable_quic(true).set_quic_options("", "BRTL", 0, 0)?;
+    /// let engine = Engine::start(&params)?;
+    ///
+    /// // Later, once a stream on the engine has its response headers:
+    /// fn shape(engine: &Engine, stream: &Stream) {
+    ///     let id = stream.connection_id();
+    ///     if id & (1 << 63) != 0 {
+    ///         engine.set_quic_send_rate(id, 12_500_000); // 100 Mbit/s
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn set_quic_send_rate(&self, connection_id: u64, bytes_per_second: u64) {
         // SAFETY: the engine is live and started; the call posts to Cronet's network thread.
         unsafe { sys::Cronet_Engine_SetQuicSendRate(self.as_ptr(), connection_id, bytes_per_second) }

@@ -24,7 +24,18 @@ use crate::{NetError, engine::NetworkThread};
 /// touching an OS socket.
 ///
 /// Implemented for every `AsyncRead + AsyncWrite + Send + Unpin + 'static`,
-/// including `Box<dyn Lower>`.
+/// including `Box<dyn Lower>`. A stream dialer
+/// ([`EngineBuilder::stream_dialer`](crate::EngineBuilder::stream_dialer))
+/// returns one per connection, and [`tls::Client`](crate::tls::Client)
+/// handshakes over one.
+///
+/// Cronet polls it on its network thread, one call at a time, with the
+/// Tokio runtime that was current when the dialer was set (or the
+/// connection started) entered. `poll_read`, `poll_write` and the rest must
+/// not block: return `Poll::Pending` and wake the waker, from any thread,
+/// when ready. Each successful `poll_write` is followed by a `poll_flush`.
+/// When the connection closes, Cronet calls `poll_shutdown` once, without
+/// waiting for it to finish, and drops the stream.
 pub trait Lower: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Lower for T {}

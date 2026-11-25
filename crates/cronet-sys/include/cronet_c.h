@@ -128,6 +128,10 @@ typedef struct Cronet_LowerStreamHandle Cronet_LowerStreamHandle;
 // data is ready yet, or another negative Chromium net error code.
 // `write` returns bytes written (> 0), -1 (ERR_IO_PENDING) when congested, or
 // another negative Chromium net error code.
+// Cronet calls `read`, `write` and `close` on its network thread, one at a
+// time, and none of them may block. After ERR_IO_PENDING, Cronet tries again
+// once the embedder reports readiness with Cronet_LowerStreamHandle_Notify.
+// `close` runs once, after which neither `read` nor `write` is called.
 typedef struct Cronet_LowerStream {
   void* context;
   intptr_t (*read)(void* context, uint8_t* buffer, size_t capacity);
@@ -140,6 +144,10 @@ typedef struct Cronet_LowerStream {
 // with Cronet_LowerStreamHandle_Destroy after `close` runs) and populates
 // `out_stream`. On failure (return a negative net error code), Cronet frees
 // `handle`.
+// `host` is the hostname being connected to, or an IP literal.
+// `connection_id` is non-zero, unique within the process, and has its high
+// bit clear; Cronet_BidirectionalStream_GetConnectionId reports it for the
+// streams the connection carries. The callback must not block.
 typedef int (*Cronet_StreamDialerFunc)(void* context,
                                        const char* host,
                                        uint16_t port,
@@ -180,6 +188,16 @@ CRONET_EXPORT uint64_t Cronet_BidirectionalStream_GetConnectionId(
 // `host` on `engine`. May be called both before and after StartWithParams().
 // Enabling any endpoint installs an in-memory HostResolver that never queries
 // system or network DNS.
+// The resolver is installed by StartWithParams() when an endpoint was
+// registered (or Cronet_Engine_ClearEndpoints was called) before it, or a
+// stream dialer is set; on an engine started without it, endpoints
+// registered later have no effect. While it is installed, every hostname
+// resolves in memory to a synthetic address: a registered host with its
+// metadata, any other host without. Only a stream dialer maps the address
+// back to the hostname; socket dialers and QUIC see the synthetic address.
+// `strict_ech` makes a rejected ECH handshake fail with
+// ERR_ECH_NOT_NEGOTIATED, never retrying without ECH or with the server's
+// retry configs.
 CRONET_EXPORT void Cronet_Engine_SetEndpoint(
     Cronet_EnginePtr engine,
     const char* host,
@@ -193,23 +211,47 @@ CRONET_EXPORT void Cronet_Engine_SetEndpoint(
 CRONET_EXPORT void Cronet_Engine_ClearEndpoints(Cronet_EnginePtr engine);
 
 // Unified TLS verification, client-auth, ALPN, and ECH configuration shared by
-// Cronet_Engine_ConfigureTls and Cronet_TlsClient_Create.
+// Cronet_Engine_ConfigureTls and Cronet_TlsClient_Create. Every pointer may
+// be null (with a zero length or count) and is read only during the call.
+//
+// When any pin is set, pins replace chain verification: a leaf whose
+// certificate or SubjectPublicKeyInfo digest is pinned is accepted as is, a
+// pinned intermediate becomes the only trust anchor, and `insecure` and
+// `pem_root_certs` are ignored.
 typedef struct Cronet_TlsConfig {
+  // Accepts any server certificate, unless pins are set.
   bool insecure;
+  // PEM root certificates; when set, the only trust anchors, never the
+  // platform's or Chrome's root store.
   const char* pem_root_certs;
+  // Name the server certificate must be valid for instead of the host; SNI
+  // still carries the host.
   const char* verify_name;
+  // `cert_pins_count` SHA-256 certificate fingerprints, 32 bytes each.
   const uint8_t* cert_pins_sha256;
   size_t cert_pins_count;
+  // `key_pins_count` SHA-256 digests of the leaf's SubjectPublicKeyInfo,
+  // 32 bytes each.
   const uint8_t* key_pins_sha256;
   size_t key_pins_count;
+  // PEM client certificate chain, offered when the server asks for one.
   const uint8_t* client_cert_pem;
   size_t client_cert_pem_len;
+  // Its private key: PKCS#8 DER, or PEM.
   const uint8_t* client_key_data;
   size_t client_key_data_len;
+  // Comma-separated ALPNs a Cronet_TlsClient offers (default "h2,http/1.1");
+  // the engine ignores it.
   const char* alpns_comma_separated;
+  // Default ECHConfigList for Cronet_TlsClient connections; the engine
+  // ignores it.
   const uint8_t* ech_config_list;
   size_t ech_config_list_len;
+  // A rejected ECH handshake fails with ERR_ECH_NOT_NEGOTIATED, never
+  // retrying without ECH or with the server's retry configs; for an engine,
+  // this applies to every host.
   bool strict_ech;
+  // Milliseconds added to the clock when checking certificate validity.
   int64_t time_offset_ms;
 } Cronet_TlsConfig;
 
@@ -221,9 +263,21 @@ CRONET_EXPORT bool Cronet_Engine_ConfigureTls(Cronet_EnginePtr engine,
                                               char* err_buf,
                                               size_t err_len);
 
+// A TLS client running Chromium's SSLClientSocket on an engine's network
+// thread.
 typedef struct Cronet_TlsClient Cronet_TlsClient;
+// One TLS connection made with a Cronet_TlsClient.
 typedef struct Cronet_TlsConn Cronet_TlsConn;
 
+// What a Cronet_TlsConn reports, on the engine's network thread.
+// `on_handshake` runs once: `net_error` is 0 on success, with the negotiated
+// ALPN ("" for none) and whether ECH was accepted; on ERR_ECH_NOT_NEGOTIATED
+// from a client without `strict_ech`, it carries the server's retry configs,
+// if any. `on_read_completed` answers each Cronet_TlsConn_Read with data
+// valid for the call (> 0 bytes), 0 at end of stream, or a negative net
+// error; `on_write_completed` answers each Cronet_TlsConn_Write. `on_closed`
+// runs last, once Cronet_TlsConn_Destroy has taken effect, after which
+// `callback_context` may be released.
 typedef struct Cronet_TlsConnCallbacks {
   void (*on_handshake)(void* context,
                        int net_error,
@@ -238,17 +292,30 @@ typedef struct Cronet_TlsConnCallbacks {
   void (*on_closed)(void* context);
 } Cronet_TlsConnCallbacks;
 
+// Creates a TLS client on the started `engine`, blocking until the engine's
+// network thread has built its certificate verifier (it runs inline when
+// called on that thread). Returns null with a NUL-terminated reason in
+// `err_buf` if `config` is invalid. The engine must outlive the client.
 CRONET_EXPORT Cronet_TlsClient* Cronet_TlsClient_Create(
     Cronet_EnginePtr engine,
     const Cronet_TlsConfig* config,
     char* err_buf,
     size_t err_len);
 
+// Changes the clock offset for later certificate checks; no effect with
+// `insecure`.
 CRONET_EXPORT void Cronet_TlsClient_SetTimeOffset(Cronet_TlsClient* client,
                                                   int64_t offset_ms);
 
+// Destroys `client` on the network thread. Destroy its connections first.
 CRONET_EXPORT void Cronet_TlsClient_Destroy(Cronet_TlsClient* client);
 
+// Creates a connection to `host:port` (`host` is sent as SNI and checked
+// against the certificate), using `ech_config_list` if given or else the
+// client's default. `*out_lower_handle` receives the handle the embedder's
+// Cronet_LowerStream signals readiness with; the embedder owns it and frees
+// it with Cronet_LowerStreamHandle_Destroy after the stream's `close` runs.
+// Returns null on invalid arguments.
 CRONET_EXPORT Cronet_TlsConn* Cronet_TlsConn_Create(
     Cronet_TlsClient* client,
     const char* host,
@@ -259,16 +326,26 @@ CRONET_EXPORT Cronet_TlsConn* Cronet_TlsConn_Create(
     void* callback_context,
     Cronet_LowerStreamHandle** out_lower_handle);
 
+// Starts the handshake over `lower_stream`, which Cronet copies and from now
+// on closes.
 CRONET_EXPORT void Cronet_TlsConn_Start(
     Cronet_TlsConn* conn,
     const Cronet_LowerStream* lower_stream);
 
+// Reads up to `max_bytes` (at most 64 KiB) after a successful handshake; one
+// read at a time, answered by `on_read_completed`.
 CRONET_EXPORT void Cronet_TlsConn_Read(Cronet_TlsConn* conn, size_t max_bytes);
 
+// Copies `data` and writes it after a successful handshake; one write at a
+// time (another fails with ERR_INVALID_ARGUMENT). `on_write_completed` runs
+// once the bytes have been handed to the lower stream.
 CRONET_EXPORT void Cronet_TlsConn_Write(Cronet_TlsConn* conn,
                                         const uint8_t* data,
                                         size_t length);
 
+// Closes `conn` and its lower stream on the network thread, then calls
+// `on_closed`. Required whether or not the handshake succeeded; `conn` must
+// not be used afterwards.
 CRONET_EXPORT void Cronet_TlsConn_Destroy(Cronet_TlsConn* conn);
 
 // Sets or updates the QUIC Brutal send rate (in bytes per second) for the
@@ -277,6 +354,9 @@ CRONET_EXPORT void Cronet_TlsConn_Destroy(Cronet_TlsConn* conn);
 // `BRTL` client connection option. Passing `0` disables fixed-rate sending
 // and falls back to BBR. Safe to call from any thread; unknown or closed
 // `connection_id` values are ignored.
+// The call posts to the network thread and returns at once. The rate
+// shapes what this side sends on that session (all its streams), up to
+// 125,000,000,000 bytes per second; it does not limit what the peer sends.
 CRONET_EXPORT void Cronet_Engine_SetQuicSendRate(Cronet_EnginePtr engine,
                                                  uint64_t connection_id,
                                                  uint64_t bytes_per_second);
