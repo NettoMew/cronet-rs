@@ -17,6 +17,7 @@
 #include "quiche/quic/core/quic_bandwidth.h"
 #include "quiche/quic/core/quic_config.h"
 #include "quiche/quic/core/quic_connection_stats.h"
+#include "quiche/quic/core/quic_constants.h"
 #include "quiche/quic/core/quic_packet_number.h"
 #include "quiche/quic/core/quic_packets.h"
 #include "quiche/quic/core/quic_tag.h"
@@ -34,15 +35,19 @@ namespace quic {
 // bytes per second) is set, the sender paces at `rate / ack_rate` using a
 // 5-second sliding window of acknowledged vs. lost packet counts (requiring at
 // least 50 samples before compensating and flooring `ack_rate` at 0.8, capping
-// loss compensation at 1.25x) and sizes its congestion window to
-// `max(4 * kDefaultTCPMSS, compensated_rate * max(srtt, 1ms) * 2)`.
+// loss compensation at 1.25x) and sizes its congestion window across a full
+// ACK round-trip:
+//   max(10 * kDefaultTCPMSS,
+//       2 * compensated_rate *
+//           (max(srtt, 1ms) +
+//            max(peer_max_ack_delay, kDefaultPeerDelayedAckTimeMs))).
 class QUICHE_EXPORT BrutalSender final : public SendAlgorithmInterface {
  public:
   static constexpr size_t kAckRateWindowSeconds = 5;
   static constexpr uint64_t kMinAckRateSamples = 50;
   static constexpr double kMinAckRate = 0.8;
   static constexpr uint64_t kCwndGain = 2;
-  static constexpr QuicPacketCount kMinCongestionWindowPackets = 4;
+  static constexpr QuicPacketCount kMinCongestionWindowPackets = 10;
   static constexpr QuicByteCount kMinCongestionWindowBytes =
       kMinCongestionWindowPackets * kDefaultTCPMSS;
   static constexpr int64_t kMinRttUs = 1000;
@@ -64,6 +69,13 @@ class QUICHE_EXPORT BrutalSender final : public SendAlgorithmInterface {
   // disables fixed-rate sending and delegates decisions back to BbrSender.
   void SetTargetRateBps(uint64_t bytes_per_second);
   uint64_t target_rate_bps() const { return target_rate_bps_; }
+
+  // Updates the peer's maximum delayed-ACK interval synchronized from
+  // QuicSentPacketManager so the congestion window covers a full ACK loop even
+  // after RttStats subtracts reported ack_delay from smoothed_rtt.
+  void SetPeerMaxAckDelay(QuicTime::Delta peer_max_ack_delay);
+  QuicTime::Delta peer_max_ack_delay() const { return peer_max_ack_delay_; }
+
   double ack_rate() const { return ack_rate_; }
   uint64_t CompensatedRateBps() const;
 
@@ -123,6 +135,8 @@ class QUICHE_EXPORT BrutalSender final : public SendAlgorithmInterface {
   const RttStats* rtt_stats_;
   BbrSender fallback_;
   uint64_t target_rate_bps_ = 0;
+  QuicTime::Delta peer_max_ack_delay_ =
+      QuicTime::Delta::FromMilliseconds(kDefaultPeerDelayedAckTimeMs);
   QuicTime origin_ = QuicTime::Zero();
   std::array<PacketSlot, kAckRateWindowSeconds> slots_{};
   double ack_rate_ = 1.0;

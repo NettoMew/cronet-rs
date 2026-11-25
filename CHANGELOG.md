@@ -13,8 +13,11 @@
   session's `connection_id`, it paces at `rate / ack_rate` using a 5-second
   sliding ACK/loss window (50-sample activation threshold, `0.8` minimum ACK
   rate = `1.25x` maximum loss compensation), sizes its congestion window to
-  `max(4 * MSS, compensated_rate * max(srtt, 1ms) * 2)`, and preserves the
-  configured rate across QUIC connection migrations.
+  `max(10 * MSS, 2 * compensated_rate * (max(srtt, 1ms) + max(peer_max_ack_delay, 25ms)))`
+  with `peer_max_ack_delay` synchronized from negotiated QUIC transport
+  parameters and `ACK_FREQUENCY` updates so delayed ACKs and coarse OS timer
+  ticks never starve pacing, and preserves the configured rate across QUIC
+  connection migrations.
 - **Session-level QUIC `connection_id` on bidirectional streams**:
   `Stream::connection_id` and `BidirectionalConn::connection_id`
   (`Cronet_BidirectionalStream_GetConnectionId`) now report `(1 << 63) | n` for

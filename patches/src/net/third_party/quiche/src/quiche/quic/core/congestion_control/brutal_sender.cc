@@ -40,6 +40,15 @@ void BrutalSender::SetTargetRateBps(uint64_t bytes_per_second) {
   target_rate_bps_ = clamped;
 }
 
+void BrutalSender::SetPeerMaxAckDelay(QuicTime::Delta peer_max_ack_delay) {
+  if (peer_max_ack_delay < QuicTime::Delta::Zero() ||
+      peer_max_ack_delay.IsInfinite()) {
+    peer_max_ack_delay_ = QuicTime::Delta::Zero();
+    return;
+  }
+  peer_max_ack_delay_ = peer_max_ack_delay;
+}
+
 uint64_t BrutalSender::CompensatedRateBps() const {
   if (target_rate_bps_ == 0) {
     return 0;
@@ -193,6 +202,7 @@ std::string BrutalSender::GetDebugState() const {
   std::ostringstream out;
   out << "Brutal(target_bps=" << target_rate_bps_ << ", ack_rate=" << ack_rate_
       << ", effective_bps=" << CompensatedRateBps()
+      << ", peer_max_ack_delay_us=" << peer_max_ack_delay_.ToMicroseconds()
       << ", cwnd=" << GetCongestionWindow() << ")";
   return out.str();
 }
@@ -257,11 +267,16 @@ void BrutalSender::UpdateAckRate(uint64_t current_second) {
 
 QuicByteCount BrutalSender::CalculateCongestionWindow() const {
   const uint64_t rate_bps = CompensatedRateBps();
-  const int64_t raw_rtt_us =
+  const int64_t raw_srtt_us =
       rtt_stats_ ? rtt_stats_->SmoothedOrInitialRtt().ToMicroseconds() : 0;
-  const uint64_t rtt_us = static_cast<uint64_t>(
-      std::clamp<int64_t>(raw_rtt_us, kMinRttUs, kMaxRttUs));
-  const uint64_t scaled_rtt_us = rtt_us * kCwndGain;
+  const uint64_t srtt_us = static_cast<uint64_t>(
+      std::clamp<int64_t>(raw_srtt_us, kMinRttUs, kMaxRttUs));
+  const int64_t default_ack_delay_us =
+      QuicTime::Delta::FromMilliseconds(kDefaultPeerDelayedAckTimeMs)
+          .ToMicroseconds();
+  const uint64_t ack_delay_us = static_cast<uint64_t>(std::clamp<int64_t>(
+      peer_max_ack_delay_.ToMicroseconds(), default_ack_delay_us, kMaxRttUs));
+  const uint64_t scaled_rtt_us = (srtt_us + ack_delay_us) * kCwndGain;
   const uint64_t whole = (rate_bps / kNumMicrosPerSecond) * scaled_rtt_us;
   const uint64_t rem =
       ((rate_bps % kNumMicrosPerSecond) * scaled_rtt_us) / kNumMicrosPerSecond;

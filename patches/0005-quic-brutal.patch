@@ -426,7 +426,7 @@ index d80cc8ae..05e824a1 100644
                                 // height to queueing threshold
  DEFINE_STATIC_QUIC_TAG(B2NE);  // For BBRv2, always exit
 diff --git a/src/net/third_party/quiche/src/quiche/quic/core/quic_sent_packet_manager.cc b/src/net/third_party/quiche/src/quiche/quic/core/quic_sent_packet_manager.cc
-index c41c424e..2008d8c5 100644
+index c41c424e..84d81132 100644
 --- a/src/net/third_party/quiche/src/quiche/quic/core/quic_sent_packet_manager.cc
 +++ b/src/net/third_party/quiche/src/quiche/quic/core/quic_sent_packet_manager.cc
 @@ -13,6 +13,7 @@
@@ -447,11 +447,21 @@ index c41c424e..2008d8c5 100644
      }
    }
  
-@@ -1263,6 +1267,38 @@ void QuicSentPacketManager::SetSendAlgorithm(
+@@ -247,6 +251,8 @@ void QuicSentPacketManager::SetFromConfig(const QuicConfig& config) {
+     num_ptos_for_path_degrading_ = 5;
+   }
+   send_algorithm_->SetFromConfig(config, perspective);
++  // Synchronize negotiated peer_max_ack_delay and cached rate to BrutalSender.
++  ApplyBrutalSendRate();
+   loss_algorithm_->SetFromConfig(config, perspective);
+ 
+   if (network_change_visitor_ != nullptr) {
+@@ -1263,6 +1269,40 @@ void QuicSentPacketManager::SetSendAlgorithm(
    }
    send_algorithm_.reset(send_algorithm);
    pacing_sender_.set_sender(send_algorithm);
-+  // Re-apply any cached Brutal target rate (e.g. after connection migration).
++  // Synchronize cached Brutal target rate and peer_max_ack_delay (e.g. after
++  // connection migration).
 +  ApplyBrutalSendRate();
 +}
 +
@@ -475,8 +485,9 @@ index c41c424e..2008d8c5 100644
 +      send_algorithm_->GetCongestionControlType() != kBrutal) {
 +    return;
 +  }
-+  static_cast<BrutalSender*>(send_algorithm_.get())
-+      ->SetTargetRateBps(brutal_send_rate_bps_);
++  auto* brutal = static_cast<BrutalSender*>(send_algorithm_.get());
++  brutal->SetPeerMaxAckDelay(peer_max_ack_delay_);
++  brutal->SetTargetRateBps(brutal_send_rate_bps_);
 +  if (brutal_send_rate_bps_ > 0) {
 +    // Disable unpaced quiescence bursts so pacing shapes short and low-RTT
 +    // transfers accurately at the configured target rate.
@@ -486,8 +497,26 @@ index c41c424e..2008d8c5 100644
  }
  
  std::unique_ptr<SendAlgorithmInterface>
+@@ -1676,6 +1716,8 @@ void QuicSentPacketManager::OnAckFrequencyFrameSent(
+       ack_frequency_frame.sequence_number);
+   if (ack_frequency_frame.requested_max_ack_delay > peer_max_ack_delay_) {
+     peer_max_ack_delay_ = ack_frequency_frame.requested_max_ack_delay;
++    // Propagate updated peer_max_ack_delay to BrutalSender if active.
++    ApplyBrutalSendRate();
+   }
+ }
+ 
+@@ -1700,6 +1742,8 @@ void QuicSentPacketManager::OnAckFrequencyFrameAcked(
+   peer_max_ack_delay_ = std::max_element(in_use_sent_ack_delays_.cbegin(),
+                                          in_use_sent_ack_delays_.cend())
+                             ->first;
++  // Propagate updated peer_max_ack_delay to BrutalSender if active.
++  ApplyBrutalSendRate();
+ }
+ 
+ float QuicSentPacketManager::GetOverheadEstimate() const {
 diff --git a/src/net/third_party/quiche/src/quiche/quic/core/quic_sent_packet_manager.h b/src/net/third_party/quiche/src/quiche/quic/core/quic_sent_packet_manager.h
-index b9bbe928..cd61f461 100644
+index b9bbe928..423704ac 100644
 --- a/src/net/third_party/quiche/src/quiche/quic/core/quic_sent_packet_manager.h
 +++ b/src/net/third_party/quiche/src/quiche/quic/core/quic_sent_packet_manager.h
 @@ -191,6 +191,11 @@ class QUICHE_EXPORT QuicSentPacketManager {
@@ -507,8 +536,8 @@ index b9bbe928..cd61f461 100644
    // code has explicitly enabled it.
    bool ecn_queried_ = false;
 +
-+  // Propagates `brutal_send_rate_bps_` to `send_algorithm_` and `pacing_sender_`
-+  // whenever `kBrutal` is active.
++  // Propagates `brutal_send_rate_bps_` and `peer_max_ack_delay_` to
++  // `send_algorithm_` and `pacing_sender_` whenever `kBrutal` is active.
 +  void ApplyBrutalSendRate();
 +
 +  uint64_t brutal_send_rate_bps_ = 0;

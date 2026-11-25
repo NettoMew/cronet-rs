@@ -450,6 +450,7 @@ struct QuicConnState {
     initial_space: PnSpace,
     handshake_space: PnSpace,
     app_space: PnSpace,
+    ack_pending: bool,
     handshake_done_sent: bool,
     streams: HashMap<u64, H3StreamState>,
     rx_1rtt_counter: usize,
@@ -478,6 +479,7 @@ impl QuicConnState {
             initial_space: PnSpace::default(),
             handshake_space: PnSpace::default(),
             app_space: PnSpace::default(),
+            ack_pending: false,
             handshake_done_sent: false,
             streams: HashMap::new(),
             rx_1rtt_counter: 0,
@@ -638,110 +640,145 @@ async fn start_quic_h3_server(server_cfg: ServerConfig) -> LocalQuicServer {
         let mut next_conn_seq: u64 = 1;
         let mut rx_buf = vec![0u8; 65536];
 
-        while let Ok((n, peer)) = sock.recv_from(&mut rx_buf).await {
-            let datagram = &rx_buf[..n];
+        while let Ok((first_n, first_peer)) = sock.recv_from(&mut rx_buf).await {
             let mut out_datagrams: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
-            let mut pos = 0usize;
+            let mut cur_n = first_n;
+            let mut cur_peer = first_peer;
+            let mut drained = 0usize;
 
-            while pos < datagram.len() {
-                let first = datagram[pos];
-                if (first & 0x80) != 0 {
-                    // Long header packet.
-                    if datagram.len() < pos + 7 {
-                        break;
-                    }
-                    let pkt_type = (first >> 4) & 0x03;
-                    let version = u32::from_be_bytes(datagram[pos + 1..pos + 5].try_into().unwrap());
-                    let mut cur = pos + 5;
-                    let dcid_len = *datagram.get(cur).unwrap_or(&0) as usize;
-                    cur += 1;
-                    if datagram.len() < cur + dcid_len + 1 {
-                        break;
-                    }
-                    let dcid = datagram[cur..cur + dcid_len].to_vec();
-                    cur += dcid_len;
-                    let scid_len = datagram[cur] as usize;
-                    cur += 1;
-                    if datagram.len() < cur + scid_len {
-                        break;
-                    }
-                    let scid = datagram[cur..cur + scid_len].to_vec();
-                    cur += scid_len;
-                    if version != 1 {
-                        break;
-                    }
-                    if pkt_type == 0 {
-                        let Some(tok_len) = read_varint(datagram, &mut cur) else {
+            // Drain up to 64 queued UDP datagrams per wakeup and coalesce
+            // standalone 1-RTT ACKs across the burst.
+            loop {
+                let datagram = &rx_buf[..cur_n];
+                let peer = cur_peer;
+                let mut pos = 0usize;
+
+                while pos < datagram.len() {
+                    let first = datagram[pos];
+                    if (first & 0x80) != 0 {
+                        // Long header packet.
+                        if datagram.len() < pos + 7 {
+                            break;
+                        }
+                        let pkt_type = (first >> 4) & 0x03;
+                        let version = u32::from_be_bytes(datagram[pos + 1..pos + 5].try_into().unwrap());
+                        let mut cur = pos + 5;
+                        let dcid_len = *datagram.get(cur).unwrap_or(&0) as usize;
+                        cur += 1;
+                        if datagram.len() < cur + dcid_len + 1 {
+                            break;
+                        }
+                        let dcid = datagram[cur..cur + dcid_len].to_vec();
+                        cur += dcid_len;
+                        let scid_len = datagram[cur] as usize;
+                        cur += 1;
+                        if datagram.len() < cur + scid_len {
+                            break;
+                        }
+                        let scid = datagram[cur..cur + scid_len].to_vec();
+                        cur += scid_len;
+                        if version != 1 {
+                            break;
+                        }
+                        if pkt_type == 0 {
+                            let Some(tok_len) = read_varint(datagram, &mut cur) else {
+                                break;
+                            };
+                            cur += tok_len as usize;
+                        }
+                        let Some(rem_len) = read_varint(datagram, &mut cur) else {
                             break;
                         };
-                        cur += tok_len as usize;
-                    }
-                    let Some(rem_len) = read_varint(datagram, &mut cur) else {
-                        break;
-                    };
-                    let pkt_end = cur + rem_len as usize;
-                    if datagram.len() < pkt_end || rem_len < 20 {
-                        break;
-                    }
-                    let mut pkt = datagram[pos..pkt_end].to_vec();
-                    let pn_offset = cur - pos;
-                    pos = pkt_end;
+                        let pkt_end = cur + rem_len as usize;
+                        if datagram.len() < pkt_end || rem_len < 20 {
+                            break;
+                        }
+                        let mut pkt = datagram[pos..pkt_end].to_vec();
+                        let pn_offset = cur - pos;
+                        pos = pkt_end;
 
-                    let scid_key = if let Ok(arr) = <[u8; 8]>::try_from(dcid.as_slice())
-                        && conns.contains_key(&arr)
-                    {
-                        arr
-                    } else if let Some(&mapped) = by_odcid.get(&dcid) {
-                        mapped
-                    } else if pkt_type == 0 {
-                        let mut srv_cid = [0u8; 8];
-                        srv_cid[..4].copy_from_slice(b"QSRV");
-                        srv_cid[4..].copy_from_slice(&(next_conn_seq as u32).to_be_bytes());
-                        next_conn_seq += 1;
-                        by_odcid.insert(dcid.clone(), srv_cid);
-                        conns.insert(srv_cid, QuicConnState::new(peer, &dcid, scid, srv_cid, cfg.clone()));
-                        srv_cid
+                        let scid_key = if let Ok(arr) = <[u8; 8]>::try_from(dcid.as_slice())
+                            && conns.contains_key(&arr)
+                        {
+                            arr
+                        } else if let Some(&mapped) = by_odcid.get(&dcid) {
+                            mapped
+                        } else if pkt_type == 0 {
+                            let mut srv_cid = [0u8; 8];
+                            srv_cid[..4].copy_from_slice(b"QSRV");
+                            srv_cid[4..].copy_from_slice(&(next_conn_seq as u32).to_be_bytes());
+                            next_conn_seq += 1;
+                            by_odcid.insert(dcid.clone(), srv_cid);
+                            conns.insert(srv_cid, QuicConnState::new(peer, &dcid, scid, srv_cid, cfg.clone()));
+                            srv_cid
+                        } else {
+                            continue;
+                        };
+
+                        let conn = conns.get_mut(&scid_key).unwrap();
+                        conn.peer = peer;
+                        let mut reply = Vec::new();
+                        process_long_packet(conn, pkt_type, &mut pkt, pn_offset, &mut reply);
+                        for d in reply {
+                            out_datagrams.push((peer, d));
+                        }
                     } else {
-                        continue;
-                    };
+                        // 1-RTT short header packet (rest of UDP datagram).
+                        if datagram.len() < pos + 1 + 8 + 20 {
+                            break;
+                        }
+                        let Ok(srv_cid) = <[u8; 8]>::try_from(&datagram[pos + 1..pos + 9]) else {
+                            break;
+                        };
+                        let mut pkt = datagram[pos..].to_vec();
+                        pos = datagram.len();
+                        let Some(conn) = conns.get_mut(&srv_cid) else {
+                            break;
+                        };
+                        conn.peer = peer;
+                        let drop_n = ctrl_loop.drop_every_n.load(Ordering::Relaxed);
+                        conn.rx_1rtt_counter = conn.rx_1rtt_counter.wrapping_add(1);
+                        if drop_n > 0 && conn.rx_1rtt_counter % drop_n == 0 {
+                            // Deterministic packet loss for Brutal loss-compensation testing.
+                            continue;
+                        }
+                        let mut reply = Vec::new();
+                        process_short_packet(conn, &mut pkt, 9, &mut reply);
+                        for d in reply {
+                            out_datagrams.push((peer, d));
+                        }
+                    }
+                }
 
-                    let conn = conns.get_mut(&scid_key).unwrap();
-                    conn.peer = peer;
-                    let mut reply = Vec::new();
-                    process_long_packet(conn, pkt_type, &mut pkt, pn_offset, &mut reply);
-                    for d in reply {
-                        out_datagrams.push((peer, d));
+                drained += 1;
+                if drained >= 64 {
+                    break;
+                }
+                match sock.try_recv_from(&mut rx_buf) {
+                    Ok((n, p)) => {
+                        cur_n = n;
+                        cur_peer = p;
                     }
-                } else {
-                    // 1-RTT short header packet (rest of UDP datagram).
-                    if datagram.len() < pos + 1 + 8 + 20 {
-                        break;
-                    }
-                    let Ok(srv_cid) = <[u8; 8]>::try_from(&datagram[pos + 1..pos + 9]) else {
-                        break;
-                    };
-                    let mut pkt = datagram[pos..].to_vec();
-                    pos = datagram.len();
-                    let Some(conn) = conns.get_mut(&srv_cid) else {
-                        break;
-                    };
-                    conn.peer = peer;
-                    let drop_n = ctrl_loop.drop_every_n.load(Ordering::Relaxed);
-                    conn.rx_1rtt_counter = conn.rx_1rtt_counter.wrapping_add(1);
-                    if drop_n > 0 && conn.rx_1rtt_counter % drop_n == 0 {
-                        // Deterministic packet loss for Brutal loss-compensation testing.
-                        continue;
-                    }
-                    let mut reply = Vec::new();
-                    process_short_packet(conn, &mut pkt, 9, &mut reply);
-                    for d in reply {
-                        out_datagrams.push((peer, d));
+                    Err(_) => break,
+                }
+            }
+
+            for conn in conns.values_mut() {
+                if conn.ack_pending && !conn.closed {
+                    conn.ack_pending = false;
+                    let mut ack = Vec::new();
+                    if conn.app_space.encode_ack(&mut ack)
+                        && let Some(pkt_out) = conn.seal_short(ack)
+                    {
+                        out_datagrams.push((conn.peer, pkt_out));
                     }
                 }
             }
 
             for (dst, bytes) in out_datagrams {
-                let _ = sock.send_to(&bytes, dst).await;
+                if sock.try_send_to(&bytes, dst).is_err() {
+                    let _ = sock.send_to(&bytes, dst).await;
+                }
             }
         }
     });
@@ -1135,14 +1172,10 @@ fn process_short_packet(conn: &mut QuicConnState, pkt: &mut [u8], pn_offset: usi
 
     if tx_frames.is_empty() {
         if ack_eliciting {
-            let mut ack = Vec::new();
-            if conn.app_space.encode_ack(&mut ack)
-                && let Some(pkt_out) = conn.seal_short(ack)
-            {
-                out.push(pkt_out);
-            }
+            conn.ack_pending = true;
         }
     } else {
+        conn.ack_pending = false;
         let mut first_with_ack = true;
         for frame in tx_frames {
             let mut plain_out = Vec::with_capacity(frame.len() + 32);
@@ -1228,7 +1261,7 @@ async fn run_h3_sink_upload(
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    let chunk = vec![0x5au8; 32 * 1024];
+    let chunk = vec![0x5au8; 512 * 1024];
     let started = Instant::now();
     let mut remaining = total_bytes;
     while remaining > 0 {
@@ -1490,9 +1523,25 @@ async fn brutal_set_quic_send_rate_shapes_throughput_close_to_target_and_compens
     let port = quic_srv.addr.port();
     let engine = build_h3_engine(&ca_pem, port, "BRTL");
 
+    // 0. Measure unthrottled throughput on the same QUIC session first and
+    //    assert the local fixture comfortably exceeds 2x the highest target
+    //    rate (2 * 4.0 MB/s = 8.0 MB/s); fail with an explicit fixture-capacity
+    //    message rather than a misleading rate-shaping failure if starved.
+    let min_fixture_bps = 8_000_000.0;
+    let (conn_id_0, baseline_bps, baseline_elapsed) = run_h3_sink_upload(&engine, port, 4 * 1024 * 1024, None).await;
+    eprintln!(
+        "[quic_brutal] fixture_unthrottled={:.0} B/s, elapsed={:?}",
+        baseline_bps, baseline_elapsed
+    );
+    assert!(
+        baseline_bps >= min_fixture_bps,
+        "local QUIC test fixture capacity insufficient on this host: unthrottled throughput {baseline_bps:.0} B/s ({baseline_elapsed:?}) < required {min_fixture_bps:.0} B/s (2x max target 4000000 B/s)"
+    );
+
     // 1. Target 1.5 MB/s: upload 2.25 MB (~1.5s) and verify throughput tracks target.
     let target_low = 1_500_000u64;
     let (conn_id_1, low_bps, low_elapsed) = run_h3_sink_upload(&engine, port, 2_250_000, Some(target_low)).await;
+    assert_eq!(conn_id_1, conn_id_0);
     eprintln!(
         "[quic_brutal] target={} B/s, measured={:.0} B/s, elapsed={:?}",
         target_low, low_bps, low_elapsed
