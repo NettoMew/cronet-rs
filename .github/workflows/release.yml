@@ -116,6 +116,7 @@ jobs:
     uses: ./.github/workflows/libcronet.yml
     with:
       ref: ${{ needs.plan.outputs.ref }}
+      targets: all
 
   release:
     needs: [plan, build]
