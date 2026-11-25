@@ -6,7 +6,8 @@ DNS, with additions for embedding it in custom transports — TCP/UDP socket and
 in-memory byte-stream dialers, synthetic HTTPS/ECH endpoint registration,
 unified TLS verification (exclusive roots, `verify_name`, SHA-256 pins, client
 certificates), standalone TLS client streams on the engine's network thread,
-and closing every connection on demand.
+per-session QUIC Brutal congestion control, and closing every connection on
+demand.
 
 | crate | what it is |
 |---|---|
@@ -18,7 +19,7 @@ and closing every connection on demand.
 
 ```toml
 [dependencies]
-cronet = { git = "https://github.com/NettoMew/cronet-rs", tag = "v0.2.0", features = ["tokio", "http"] }
+cronet = { git = "https://github.com/NettoMew/cronet-rs", tag = "v0.3.0", features = ["tokio", "http"] }
 ```
 
 | feature | adds |
@@ -112,6 +113,21 @@ let mut tls_stream = tls_client
 assert!(tls_stream.ech_accepted());
 assert_eq!(tls_stream.alpn(), Some("h2"));
 // `tls_stream` implements `tokio::io::AsyncRead + AsyncWrite`.
+```
+
+Per-session QUIC Brutal congestion control (`BRTL`), activated dynamically once
+an HTTP/3 stream negotiates a target send rate:
+
+```rust
+let mut params = EngineParams::new();
+params.set_enable_quic(true).set_quic_options("", "BRTL", 0, 0)?;
+let engine = Engine::builder().start(&params)?;
+
+let mut h3_stream = BidirectionalConn::new(&engine, ConnOptions::default());
+h3_stream.start("POST", "https://quic.example/v1/stream", &[], StreamPriority::Medium, false)?;
+let _headers = h3_stream.headers().await?;
+// QUIC sessions report `(1 << 63) | n`; `0` falls back to BBR.
+engine.set_quic_send_rate(h3_stream.connection_id(), 12_500_000);
 ```
 
 Underneath, everything Cronet's C API offers is there: `UrlRequest` with a

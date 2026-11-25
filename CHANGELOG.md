@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+
+- **QUIC Brutal congestion control (`BRTL` / `Engine::set_quic_send_rate`)**:
+  passing `BRTL` in `client_connection_options`
+  (`EngineParamsRef::set_quic_options`) selects `BrutalSender` on client QUIC
+  sessions. Until a rate is configured (or after setting `0`), `BrutalSender`
+  delegates to an embedded `BbrSender`; once `Engine::set_quic_send_rate`
+  (`Cronet_Engine_SetQuicSendRate`) sets a non-zero byte-per-second target for a
+  session's `connection_id`, it paces at `rate / ack_rate` using a 5-second
+  sliding ACK/loss window (50-sample activation threshold, `0.8` minimum ACK
+  rate = `1.25x` maximum loss compensation), sizes its congestion window to
+  `max(4 * MSS, compensated_rate * max(srtt, 1ms) * 2)`, and preserves the
+  configured rate across QUIC connection migrations.
+- **Session-level QUIC `connection_id` on bidirectional streams**:
+  `Stream::connection_id` and `BidirectionalConn::connection_id`
+  (`Cronet_BidirectionalStream_GetConnectionId`) now report `(1 << 63) | n` for
+  HTTP/3 streams, uniquely identifying each `QuicChromiumClientSession` across
+  multiplexed streams and UDP socket migrations while keeping stream-dialed TCP
+  IDs (`(id & (1 << 63)) == 0`) disjoint and default OS-socket TCP streams at
+  `0`.
+
 ## 0.2.0
 
 ### Added
