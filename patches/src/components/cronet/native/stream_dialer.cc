@@ -16,6 +16,7 @@
 #include "net/base/io_buffer.h"
 #include "net/base/ip_address.h"
 #include "net/base/net_errors.h"
+#include "net/quic/quic_chromium_client_session.h"
 #include "net/socket/datagram_client_socket.h"
 #include "net/socket/ssl_client_socket.h"
 
@@ -518,5 +519,8 @@ CRONET_EXPORT uint64_t Cronet_BidirectionalStream_GetConnectionId(
     return 0;
   }
   uint32_t socket_log_id = bidirectional_stream_get_socket_log_id(stream);
-  return cronet::LookupConnectionIdBySocketLogId(socket_log_id);
+  if (uint64_t id = cronet::LookupConnectionIdBySocketLogId(socket_log_id)) {
+    return id;
+  }
+  return net::LookupQuicSessionConnectionIdByLogId(socket_log_id);
 }

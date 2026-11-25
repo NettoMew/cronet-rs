@@ -1,0 +1,544 @@
+diff --git a/src/components/cronet/cronet_context.cc b/src/components/cronet/cronet_context.cc
+index 06ce7418..95540c09 100644
+--- a/src/components/cronet/cronet_context.cc
++++ b/src/components/cronet/cronet_context.cc
+@@ -40,6 +40,7 @@
+ #include "components/cronet/host_cache_persistence_manager.h"
+ #include "components/cronet/url_request_context_config.h"
+ #include "net/base/completion_once_callback.h"
++#include "net/quic/quic_session_pool.h"
+ #include "net/base/ip_address.h"
+ #include "net/base/load_flags.h"
+ #include "net/base/logging_network_change_observer.h"
+@@ -627,6 +628,24 @@ void CronetContext::NetworkTasks::CloseAllConnections() {
+   }
+ }
+ 
++void CronetContext::NetworkTasks::SetQuicSendRate(uint64_t connection_id,
++                                                  uint64_t bytes_per_second) {
++  DCHECK_CALLED_ON_VALID_THREAD(network_thread_checker_);
++  for (const auto& context_entry : contexts_) {
++    net::HttpTransactionFactory* transaction_factory =
++        context_entry.second->http_transaction_factory();
++    if (!transaction_factory) {
++      continue;
++    }
++    net::HttpNetworkSession* session = transaction_factory->GetSession();
++    if (session && session->quic_session_pool() &&
++        session->quic_session_pool()->SetSessionBrutalSendRate(
++            connection_id, bytes_per_second)) {
++      return;
++    }
++  }
++}
++
+ void CronetContext::NetworkTasks::MaybeDestroyURLRequestContext(
+     net::handles::NetworkHandle network) {
+   DCHECK_CALLED_ON_VALID_THREAD(network_thread_checker_);
+@@ -699,6 +718,15 @@ void CronetContext::CloseAllConnections(base::OnceClosure completion) {
+           base::Unretained(network_tasks_), std::move(completion)));
+ }
+ 
++void CronetContext::SetQuicSendRate(uint64_t connection_id,
++                                    uint64_t bytes_per_second) {
++  PostTaskToNetworkThread(
++      FROM_HERE,
++      base::BindOnce(&CronetContext::NetworkTasks::SetQuicSendRate,
++                     base::Unretained(network_tasks_), connection_id,
++                     bytes_per_second));
++}
++
+ void CronetContext::PostTaskToNetworkThread(const base::Location& posted_from,
+                                             base::OnceClosure callback) {
+   GetNetworkTaskRunner()->PostTask(
+diff --git a/src/components/cronet/cronet_context.h b/src/components/cronet/cronet_context.h
+index 64f52d0a..dcf588d9 100644
+--- a/src/components/cronet/cronet_context.h
++++ b/src/components/cronet/cronet_context.h
+@@ -177,6 +177,9 @@ class CronetContext {
+   // `completion`. This can be called on any thread.
+   void CloseAllConnections(base::OnceClosure completion);
+ 
++  // Posts a per-session QUIC Brutal send-rate update onto the network thread.
++  void SetQuicSendRate(uint64_t connection_id, uint64_t bytes_per_second);
++
+   // Returns a new instance of net::URLRequestContextGetter.
+   // The net::URLRequestContext and base::SingleThreadTaskRunner that
+   // net::URLRequestContextGetter returns are owned by `this`.
+@@ -308,6 +311,9 @@ class CronetContext {
+ 
+     void CloseAllConnections();
+ 
++    // Updates the QUIC Brutal send rate on the matching live QUIC session.
++    void SetQuicSendRate(uint64_t connection_id, uint64_t bytes_per_second);
++
+     // Same as StartNetLogToDisk.
+     void StartNetLogToBoundedFile(const std::string& dir_path,
+                                   bool include_socket_bytes,
+diff --git a/src/components/cronet/native/engine.cc b/src/components/cronet/native/engine.cc
+index c3676704..46c647e2 100644
+--- a/src/components/cronet/native/engine.cc
++++ b/src/components/cronet/native/engine.cc
+@@ -638,6 +638,18 @@ void Cronet_EngineImpl::CloseAllConnections() {
+   done.Wait();
+ }
+ 
++void Cronet_EngineImpl::SetQuicSendRate(uint64_t connection_id,
++                                        uint64_t bytes_per_second) {
++  if (connection_id == 0) {
++    return;
++  }
++  base::AutoLock lock(lock_);
++  if (!context_) {
++    return;
++  }
++  context_->SetQuicSendRate(connection_id, bytes_per_second);
++}
++
+ stream_engine* Cronet_EngineImpl::GetBidirectionalStreamEngine() {
+   init_completed_.Wait();
+   return stream_engine_.get();
+@@ -702,6 +714,16 @@ CRONET_EXPORT void Cronet_Engine_CloseAllConnections(
+   static_cast<cronet::Cronet_EngineImpl*>(engine)->CloseAllConnections();
+ }
+ 
++CRONET_EXPORT void Cronet_Engine_SetQuicSendRate(Cronet_EnginePtr engine,
++                                                 uint64_t connection_id,
++                                                 uint64_t bytes_per_second) {
++  if (!engine) {
++    return;
++  }
++  static_cast<cronet::Cronet_EngineImpl*>(engine)->SetQuicSendRate(
++      connection_id, bytes_per_second);
++}
++
+ CRONET_EXPORT void Cronet_Engine_SetEndpoint(
+     Cronet_EnginePtr engine,
+     const char* host,
+diff --git a/src/components/cronet/native/engine.h b/src/components/cronet/native/engine.h
+index c4af9e96..9cbe59fc 100644
+--- a/src/components/cronet/native/engine.h
++++ b/src/components/cronet/native/engine.h
+@@ -96,6 +96,9 @@ class Cronet_EngineImpl : public Cronet_Engine {
+   // Close all connections managed by the engine's network session.
+   void CloseAllConnections();
+ 
++  // Sets or updates the per-session QUIC Brutal send rate (bytes/sec).
++  void SetQuicSendRate(uint64_t connection_id, uint64_t bytes_per_second);
++
+   void SetEndpoint(const char* host,
+                    const uint8_t* ech_config_list,
+                    size_t ech_config_list_len,
+diff --git a/src/components/cronet/native/include/cronet_c.h b/src/components/cronet/native/include/cronet_c.h
+index 6ef81a2c..abc045c9 100644
+--- a/src/components/cronet/native/include/cronet_c.h
++++ b/src/components/cronet/native/include/cronet_c.h
+@@ -166,8 +166,12 @@ CRONET_EXPORT void Cronet_LowerStreamHandle_Notify(
+ CRONET_EXPORT void Cronet_LowerStreamHandle_Destroy(
+     Cronet_LowerStreamHandle* handle);
+ 
+-// Returns the `connection_id` of the transport connection carrying `stream`,
+-// or 0 if not established over a custom stream dialer.
++// Returns the `connection_id` of the transport connection carrying `stream`:
++// - for TCP connections opened via a custom stream dialer, the non-zero ID
++//   passed to `Cronet_StreamDialerFunc` (high bit 0);
++// - for QUIC sessions, `(1ULL << 63) | n` (high bit 1), shared by all HTTP/3
++//   streams multiplexed onto the same QUIC session;
++// - 0 for default OS-socket TCP connections or streams not yet bound.
+ CRONET_EXPORT uint64_t Cronet_BidirectionalStream_GetConnectionId(
+     bidirectional_stream* stream);
+ 
+@@ -267,6 +271,16 @@ CRONET_EXPORT void Cronet_TlsConn_Write(Cronet_TlsConn* conn,
+ 
+ CRONET_EXPORT void Cronet_TlsConn_Destroy(Cronet_TlsConn* conn);
+ 
++// Sets or updates the QUIC Brutal send rate (in bytes per second) for the
++// live QUIC session identified by `connection_id` (`(1ULL << 63) | n` from
++// Cronet_BidirectionalStream_GetConnectionId) when the engine negotiated the
++// `BRTL` client connection option. Passing `0` disables fixed-rate sending
++// and falls back to BBR. Safe to call from any thread; unknown or closed
++// `connection_id` values are ignored.
++CRONET_EXPORT void Cronet_Engine_SetQuicSendRate(Cronet_EnginePtr engine,
++                                                 uint64_t connection_id,
++                                                 uint64_t bytes_per_second);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/net/quic/bidirectional_stream_quic_impl.cc b/src/net/quic/bidirectional_stream_quic_impl.cc
+index 83bf267a..24548156 100644
+--- a/src/net/quic/bidirectional_stream_quic_impl.cc
++++ b/src/net/quic/bidirectional_stream_quic_impl.cc
+@@ -224,6 +224,11 @@ bool BidirectionalStreamQuicImpl::GetLoadTimingInfo(
+   } else {
+     load_timing_info->socket_reused = true;
+   }
++  // Propagate the parent QUIC session's NetLog source ID so Cronet streams can
++  // resolve the session-level transport connection_id.
++  if (session_) {
++    load_timing_info->socket_log_id = session_->net_log().source().id;
++  }
+   return true;
+ }
+ 
+diff --git a/src/net/quic/quic_chromium_client_session.cc b/src/net/quic/quic_chromium_client_session.cc
+index b2ae4053..6eaac69e 100644
+--- a/src/net/quic/quic_chromium_client_session.cc
++++ b/src/net/quic/quic_chromium_client_session.cc
+@@ -5,12 +5,15 @@
+ #include "net/quic/quic_chromium_client_session.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <memory>
+ #include <set>
+ #include <string_view>
++#include <unordered_map>
+ #include <utility>
+ 
+ #include "base/compiler_specific.h"
++#include "base/synchronization/lock.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+@@ -504,8 +507,56 @@ EchMode GetEchModeForHost(SSLConfigService* ssl_config_service,
+   return ssl_config_service->GetEchMode(host);
+ }
+ 
++// Thread-safe registry mapping a live QuicChromiumClientSession's NetLog source
++// ID (`socket_log_id`) to its `(1ULL << 63) | n` transport connection_id.
++struct QuicSessionConnectionIdRegistry {
++  base::Lock lock;
++  std::unordered_map<uint32_t, uint64_t> by_log_id;
++};
++
++QuicSessionConnectionIdRegistry& GetQuicSessionConnectionIdRegistry() {
++  static base::NoDestructor<QuicSessionConnectionIdRegistry> registry;
++  return *registry;
++}
++
++uint64_t NextQuicTransportConnectionId() {
++  static std::atomic<uint64_t> next_id{1};
++  constexpr uint64_t kQuicConnectionIdBit = uint64_t{1} << 63;
++  return kQuicConnectionIdBit |
++         (next_id.fetch_add(1, std::memory_order_relaxed) &
++          ~kQuicConnectionIdBit);
++}
++
++void RegisterQuicSessionLogId(uint32_t log_id, uint64_t connection_id) {
++  if (log_id == 0 || connection_id == 0) {
++    return;
++  }
++  auto& reg = GetQuicSessionConnectionIdRegistry();
++  base::AutoLock guard(reg.lock);
++  reg.by_log_id[log_id] = connection_id;
++}
++
++void UnregisterQuicSessionLogId(uint32_t log_id) {
++  if (log_id == 0) {
++    return;
++  }
++  auto& reg = GetQuicSessionConnectionIdRegistry();
++  base::AutoLock guard(reg.lock);
++  reg.by_log_id.erase(log_id);
++}
++
+ }  // namespace
+ 
++uint64_t LookupQuicSessionConnectionIdByLogId(uint32_t socket_log_id) {
++  if (socket_log_id == 0) {
++    return 0;
++  }
++  auto& reg = GetQuicSessionConnectionIdRegistry();
++  base::AutoLock guard(reg.lock);
++  auto it = reg.by_log_id.find(socket_log_id);
++  return it != reg.by_log_id.end() ? it->second : 0;
++}
++
+ // static
+ void QuicChromiumClientSession::SetMidMigrationCallbackForTesting(
+     base::OnceClosure callback) {
+@@ -1164,9 +1215,14 @@ QuicChromiumClientSession::QuicChromiumClientSession(
+     connection->set_initial_retransmittable_on_wire_timeout(
+         retransmittable_on_wire_timeout);
+   }
++  // Assign and register a session-level transport connection_id so HTTP/3
++  // streams can correlate with this QUIC session across socket migrations.
++  transport_connection_id_ = NextQuicTransportConnectionId();
++  RegisterQuicSessionLogId(net_log_.source().id, transport_connection_id_);
+ }
+ 
+ QuicChromiumClientSession::~QuicChromiumClientSession() {
++  UnregisterQuicSessionLogId(net_log_.source().id);
+   DCHECK(callback_.is_null());
+ 
+   for (auto& observer : connectivity_observer_list_) {
+@@ -1251,6 +1307,14 @@ QuicChromiumClientSession::~QuicChromiumClientSession() {
+                               stats.max_sequence_reordering));
+ }
+ 
++void QuicChromiumClientSession::SetBrutalSendRate(uint64_t bytes_per_second) {
++  if (!connection() || !connection()->connected()) {
++    return;
++  }
++  connection()->sent_packet_manager().SetBrutalSendRate(bytes_per_second);
++  connection()->WriteIfNotBlocked();
++}
++
+ void QuicChromiumClientSession::Initialize() {
+   set_max_inbound_header_list_size(kQuicMaxHeaderListSize);
+   quic::QuicSpdyClientSessionBase::Initialize();
+diff --git a/src/net/quic/quic_chromium_client_session.h b/src/net/quic/quic_chromium_client_session.h
+index 64fd6db1..93215fe6 100644
+--- a/src/net/quic/quic_chromium_client_session.h
++++ b/src/net/quic/quic_chromium_client_session.h
+@@ -873,6 +873,14 @@ class NET_EXPORT_PRIVATE QuicChromiumClientSession
+ 
+   const NetLogWithSource& net_log() const { return net_log_; }
+ 
++  // Unique session-level identifier (`(1ULL << 63) | n`, disjoint from TCP
++  // stream-dialer IDs) exposed via Cronet_BidirectionalStream_GetConnectionId.
++  uint64_t transport_connection_id() const { return transport_connection_id_; }
++
++  // Updates the QUIC Brutal send rate (bytes/sec, 0 = BBR fallback) on this
++  // session's connection and wakes blocked writes.
++  void SetBrutalSendRate(uint64_t bytes_per_second);
++
+   // Returns true if the stream factory disables gQUIC 0-RTT.
+   bool gquic_zero_rtt_disabled() const;
+ 
+@@ -1325,9 +1333,16 @@ class NET_EXPORT_PRIVATE QuicChromiumClientSession
+ 
+   bool crypto_handshake_complete_ = false;
+ 
++  uint64_t transport_connection_id_ = 0;
++
+   base::WeakPtrFactory<QuicChromiumClientSession> weak_factory_{this};
+ };
+ 
++// Resolves a QUIC session's `transport_connection_id()` from its NetLog source
++// ID (`socket_log_id`), or returns 0 if no live session owns `socket_log_id`.
++NET_EXPORT_PRIVATE uint64_t
++LookupQuicSessionConnectionIdByLogId(uint32_t socket_log_id);
++
+ namespace features {
+ 
+ // When enabled, network disconnect signals don't trigger immediate migration
+diff --git a/src/net/quic/quic_session_pool.cc b/src/net/quic/quic_session_pool.cc
+index 9e7b1307..d892964c 100644
+--- a/src/net/quic/quic_session_pool.cc
++++ b/src/net/quic/quic_session_pool.cc
+@@ -1161,6 +1161,22 @@ void QuicSessionPool::CloseAllSessions(int error,
+   });
+ }
+ 
++bool QuicSessionPool::SetSessionBrutalSendRate(
++    uint64_t transport_connection_id,
++    uint64_t bytes_per_second) {
++  if (transport_connection_id == 0) {
++    return false;
++  }
++  for (const auto& session : all_sessions_) {
++    if (session &&
++        session->transport_connection_id() == transport_connection_id) {
++      session->SetBrutalSendRate(bytes_per_second);
++      return true;
++    }
++  }
++  return false;
++}
++
+ base::Value QuicSessionPool::QuicSessionPoolInfoToValue() const {
+   base::ListValue list;
+ 
+diff --git a/src/net/quic/quic_session_pool.h b/src/net/quic/quic_session_pool.h
+index 7456d010..7bbd3b71 100644
+--- a/src/net/quic/quic_session_pool.h
++++ b/src/net/quic/quic_session_pool.h
+@@ -431,6 +431,11 @@ class NET_EXPORT_PRIVATE QuicSessionPool
+   // It sends connection close packet when closing connections.
+   void CloseAllSessions(int error, quic::QuicErrorCode quic_error);
+ 
++  // Updates the QUIC Brutal send rate (bytes/sec) on the live session matching
++  // `transport_connection_id`. Returns true if a matching session was updated.
++  bool SetSessionBrutalSendRate(uint64_t transport_connection_id,
++                                uint64_t bytes_per_second);
++
+   base::Value QuicSessionPoolInfoToValue() const;
+ 
+   // Delete cached state objects in |crypto_config_|. If |origin_filter| is not
+diff --git a/src/net/third_party/quiche/src/build/source_list.gni b/src/net/third_party/quiche/src/build/source_list.gni
+index fd66f952..3fd32ba3 100644
+--- a/src/net/third_party/quiche/src/build/source_list.gni
++++ b/src/net/third_party/quiche/src/build/source_list.gni
+@@ -160,6 +160,8 @@ quiche_core_hdrs = [
+     "src/quiche/quic/core/congestion_control/bbr2_startup.h",
+     "src/quiche/quic/core/congestion_control/bbr3_sender.h",
+     "src/quiche/quic/core/congestion_control/bbr_sender.h",
++    # QUIC Brutal congestion control header.
++    "src/quiche/quic/core/congestion_control/brutal_sender.h",
+     "src/quiche/quic/core/congestion_control/cubic_bytes.h",
+     "src/quiche/quic/core/congestion_control/general_loss_algorithm.h",
+     "src/quiche/quic/core/congestion_control/hybrid_slow_start.h",
+@@ -529,6 +531,8 @@ quiche_core_srcs = [
+     "src/quiche/quic/core/congestion_control/bbr2_startup.cc",
+     "src/quiche/quic/core/congestion_control/bbr3_sender.cc",
+     "src/quiche/quic/core/congestion_control/bbr_sender.cc",
++    # QUIC Brutal congestion control implementation.
++    "src/quiche/quic/core/congestion_control/brutal_sender.cc",
+     "src/quiche/quic/core/congestion_control/cubic_bytes.cc",
+     "src/quiche/quic/core/congestion_control/general_loss_algorithm.cc",
+     "src/quiche/quic/core/congestion_control/hybrid_slow_start.cc",
+diff --git a/src/net/third_party/quiche/src/quiche/quic/core/congestion_control/send_algorithm_interface.cc b/src/net/third_party/quiche/src/quiche/quic/core/congestion_control/send_algorithm_interface.cc
+index 33bcf861..ad95cb3d 100644
+--- a/src/net/third_party/quiche/src/quiche/quic/core/congestion_control/send_algorithm_interface.cc
++++ b/src/net/third_party/quiche/src/quiche/quic/core/congestion_control/send_algorithm_interface.cc
+@@ -8,6 +8,7 @@
+ #include "quiche/quic/core/congestion_control/bbr2_sender.h"
+ #include "quiche/quic/core/congestion_control/bbr3_sender.h"
+ #include "quiche/quic/core/congestion_control/bbr_sender.h"
++#include "quiche/quic/core/congestion_control/brutal_sender.h"
+ #include "quiche/quic/core/congestion_control/prague_sender.h"
+ #include "quiche/quic/core/congestion_control/tcp_cubic_sender_bytes.h"
+ #include "quiche/quic/core/crypto/quic_random.h"
+@@ -66,6 +67,11 @@ SendAlgorithmInterface* SendAlgorithmInterface::Create(
+     case kPragueCubic:
+       return new PragueSender(clock, rtt_stats, initial_congestion_window,
+                               max_congestion_window, stats);
++    // Construct BrutalSender (delegates to BbrSender while target rate is 0).
++    case kBrutal:
++      return new BrutalSender(clock->ApproximateNow(), rtt_stats,
++                              unacked_packets, initial_congestion_window,
++                              max_congestion_window, random, stats);
+   }
+   return nullptr;
+ }
+diff --git a/src/net/third_party/quiche/src/quiche/quic/core/crypto/crypto_protocol.h b/src/net/third_party/quiche/src/quiche/quic/core/crypto/crypto_protocol.h
+index d80cc8ae..05e824a1 100644
+--- a/src/net/third_party/quiche/src/quiche/quic/core/crypto/crypto_protocol.h
++++ b/src/net/third_party/quiche/src/quiche/quic/core/crypto/crypto_protocol.h
+@@ -155,6 +155,7 @@ DEFINE_STATIC_QUIC_TAG(IW20);  // Force ICWND to 20
+ DEFINE_STATIC_QUIC_TAG(IW50);  // Force ICWND to 50
+ DEFINE_STATIC_QUIC_TAG(IW2X);  // Force ICWND to 2x its default value.
+ DEFINE_STATIC_QUIC_TAG(B2ON);  // Enable BBRv2
++DEFINE_STATIC_QUIC_TAG(BRTL);  // Enable client-side QUIC Brutal sender
+ DEFINE_STATIC_QUIC_TAG(B2NA);  // For BBRv2, do not add ack
+                                // height to queueing threshold
+ DEFINE_STATIC_QUIC_TAG(B2NE);  // For BBRv2, always exit
+diff --git a/src/net/third_party/quiche/src/quiche/quic/core/quic_sent_packet_manager.cc b/src/net/third_party/quiche/src/quiche/quic/core/quic_sent_packet_manager.cc
+index c41c424e..2008d8c5 100644
+--- a/src/net/third_party/quiche/src/quiche/quic/core/quic_sent_packet_manager.cc
++++ b/src/net/third_party/quiche/src/quiche/quic/core/quic_sent_packet_manager.cc
+@@ -13,6 +13,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "quiche/quic/core/congestion_control/brutal_sender.h"
+ #include "quiche/quic/core/congestion_control/loss_detection_interface.h"
+ #include "quiche/quic/core/congestion_control/pacing_sender.h"
+ #include "quiche/quic/core/congestion_control/send_algorithm_interface.h"
+@@ -169,6 +170,9 @@ void QuicSentPacketManager::SetFromConfig(const QuicConfig& config) {
+       SetSendAlgorithm(kPragueCubic);
+     } else if (config.HasClientRequestedIndependentOption(kCQBC, perspective)) {
+       SetSendAlgorithm(kCubicBytes);
++    } else if (config.HasClientRequestedIndependentOption(kBRTL, perspective)) {
++      // Select BrutalSender when the client requests the local BRTL option.
++      SetSendAlgorithm(kBrutal);
+     }
+   }
+ 
+@@ -1263,6 +1267,38 @@ void QuicSentPacketManager::SetSendAlgorithm(
+   }
+   send_algorithm_.reset(send_algorithm);
+   pacing_sender_.set_sender(send_algorithm);
++  // Re-apply any cached Brutal target rate (e.g. after connection migration).
++  ApplyBrutalSendRate();
++}
++
++void QuicSentPacketManager::SetBrutalSendRate(uint64_t bytes_per_second) {
++  const bool was_enabled = brutal_send_rate_bps_ > 0;
++  brutal_send_rate_bps_ = bytes_per_second;
++  if (send_algorithm_ != nullptr &&
++      send_algorithm_->GetCongestionControlType() == kBrutal) {
++    ApplyBrutalSendRate();
++    if (was_enabled && brutal_send_rate_bps_ == 0) {
++      pacing_sender_.SetBurstTokens(10);
++    }
++    if (network_change_visitor_ != nullptr) {
++      network_change_visitor_->OnCongestionChange();
++    }
++  }
++}
++
++void QuicSentPacketManager::ApplyBrutalSendRate() {
++  if (send_algorithm_ == nullptr ||
++      send_algorithm_->GetCongestionControlType() != kBrutal) {
++    return;
++  }
++  static_cast<BrutalSender*>(send_algorithm_.get())
++      ->SetTargetRateBps(brutal_send_rate_bps_);
++  if (brutal_send_rate_bps_ > 0) {
++    // Disable unpaced quiescence bursts so pacing shapes short and low-RTT
++    // transfers accurately at the configured target rate.
++    pacing_sender_.set_remove_non_initial_burst();
++    pacing_sender_.SetBurstTokens(0);
++  }
+ }
+ 
+ std::unique_ptr<SendAlgorithmInterface>
+diff --git a/src/net/third_party/quiche/src/quiche/quic/core/quic_sent_packet_manager.h b/src/net/third_party/quiche/src/quiche/quic/core/quic_sent_packet_manager.h
+index b9bbe928..cd61f461 100644
+--- a/src/net/third_party/quiche/src/quiche/quic/core/quic_sent_packet_manager.h
++++ b/src/net/third_party/quiche/src/quiche/quic/core/quic_sent_packet_manager.h
+@@ -191,6 +191,11 @@ class QUICHE_EXPORT QuicSentPacketManager {
+     return pacing_sender_.max_pacing_rate();
+   }
+ 
++  // Caches and applies the per-session QUIC Brutal send rate (bytes/sec),
++  // preserving it across send-algorithm resets during connection migration.
++  void SetBrutalSendRate(uint64_t bytes_per_second);
++  uint64_t brutal_send_rate_bps() const { return brutal_send_rate_bps_; }
++
+   // Called to mark the handshake state complete, and all handshake packets are
+   // neutered.
+   // TODO(fayang): Rename this function to OnHandshakeComplete.
+@@ -772,6 +777,12 @@ class QUICHE_EXPORT QuicSentPacketManager {
+   // used to prevent the execution of ECN-specific code unless flag-protected
+   // code has explicitly enabled it.
+   bool ecn_queried_ = false;
++
++  // Propagates `brutal_send_rate_bps_` to `send_algorithm_` and `pacing_sender_`
++  // whenever `kBrutal` is active.
++  void ApplyBrutalSendRate();
++
++  uint64_t brutal_send_rate_bps_ = 0;
+ };
+ 
+ }  // namespace quic
+diff --git a/src/net/third_party/quiche/src/quiche/quic/core/quic_types.cc b/src/net/third_party/quiche/src/quiche/quic/core/quic_types.cc
+index 2b82db8e..e4a94d7d 100644
+--- a/src/net/third_party/quiche/src/quiche/quic/core/quic_types.cc
++++ b/src/net/third_party/quiche/src/quiche/quic/core/quic_types.cc
+@@ -332,6 +332,9 @@ std::string CongestionControlTypeToString(CongestionControlType cc_type) {
+       return "GoogCC";
+     case kPragueCubic:
+       return "PRAGUE_CUBIC";
++    // String name for CongestionControlType::kBrutal.
++    case kBrutal:
++      return "BRUTAL";
+   }
+   return absl::StrCat("Unknown(", static_cast<int>(cc_type), ")");
+ }
+diff --git a/src/net/third_party/quiche/src/quiche/quic/core/quic_types.h b/src/net/third_party/quiche/src/quiche/quic/core/quic_types.h
+index d944929c..bd0a988d 100644
+--- a/src/net/third_party/quiche/src/quiche/quic/core/quic_types.h
++++ b/src/net/third_party/quiche/src/quiche/quic/core/quic_types.h
+@@ -478,6 +478,8 @@ enum CongestionControlType {
+   kBBRv2,  // This has some changes from BBRv3 as well.
+   kBBRv3,
+   kPragueCubic,
++  // Fixed-rate congestion control with ACK-rate loss compensation (BRTL).
++  kBrutal,
+ };
+ 
+ QUICHE_EXPORT std::string CongestionControlTypeToString(

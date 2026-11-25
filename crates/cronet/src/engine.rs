@@ -500,6 +500,21 @@ impl Engine {
         unsafe { sys::Cronet_Engine_ClearEndpoints(self.as_ptr()) }
     }
 
+    /// Sets or updates the QUIC Brutal send rate (in bytes per second) for the
+    /// QUIC session identified by `connection_id` (from
+    /// [`Stream::connection_id`](crate::Stream::connection_id) or
+    /// [`BidirectionalConn::connection_id`](crate::BidirectionalConn::connection_id))
+    /// when the engine was started with the `BRTL` QUIC client connection
+    /// option (see [`EngineParamsRef::set_quic_options`]).
+    ///
+    /// Passing `0` disables fixed-rate sending and delegates congestion control
+    /// back to BBR. May be called from any thread; unknown or already closed
+    /// `connection_id` values are ignored.
+    pub fn set_quic_send_rate(&self, connection_id: u64, bytes_per_second: u64) {
+        // SAFETY: the engine is live and started; the call posts to Cronet's network thread.
+        unsafe { sys::Cronet_Engine_SetQuicSendRate(self.as_ptr(), connection_id, bytes_per_second) }
+    }
+
     pub(crate) fn as_ptr(&self) -> sys::Cronet_EnginePtr {
         self.0.raw.as_ptr()
     }

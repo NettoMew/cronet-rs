@@ -356,7 +356,7 @@ impl EngineParamsRef {
     /// Both are lists of QUIC connection option tags. `connection_options`
     /// travel to the server in the handshake and shape what it does;
     /// `client_connection_options` stay local and shape what this side does,
-    /// such as which congestion controller sends (`TBBR`, `B2ON`, ...).
+    /// such as which congestion controller sends (`TBBR`, `B2ON`, `BRTL`, ...).
     pub fn set_quic_options(
         &mut self,
         connection_options: &str,

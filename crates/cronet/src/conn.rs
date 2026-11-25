@@ -273,9 +273,10 @@ impl BidirectionalConn {
         &self.stream
     }
 
-    /// The [`Target::connection_id`](crate::Target::connection_id) of the
-    /// transport connection carrying this stream, or `0` if not dialed via
-    /// [`EngineBuilder::stream_dialer`](crate::EngineBuilder::stream_dialer).
+    /// The transport `connection_id` carrying this stream: see
+    /// [`Stream::connection_id`] (`(id & (1 << 63)) == 0` for
+    /// [`EngineBuilder::stream_dialer`](crate::EngineBuilder::stream_dialer)
+    /// TCP connections, `(1 << 63) | n` for QUIC sessions, or `0` otherwise).
     pub fn connection_id(&self) -> u64 {
         self.stream.connection_id()
     }

@@ -166,8 +166,12 @@ CRONET_EXPORT void Cronet_LowerStreamHandle_Notify(
 CRONET_EXPORT void Cronet_LowerStreamHandle_Destroy(
     Cronet_LowerStreamHandle* handle);
 
-// Returns the `connection_id` of the transport connection carrying `stream`,
-// or 0 if not established over a custom stream dialer.
+// Returns the `connection_id` of the transport connection carrying `stream`:
+// - for TCP connections opened via a custom stream dialer, the non-zero ID
+//   passed to `Cronet_StreamDialerFunc` (high bit 0);
+// - for QUIC sessions, `(1ULL << 63) | n` (high bit 1), shared by all HTTP/3
+//   streams multiplexed onto the same QUIC session;
+// - 0 for default OS-socket TCP connections or streams not yet bound.
 CRONET_EXPORT uint64_t Cronet_BidirectionalStream_GetConnectionId(
     bidirectional_stream* stream);
 
@@ -266,6 +270,16 @@ CRONET_EXPORT void Cronet_TlsConn_Write(Cronet_TlsConn* conn,
                                         size_t length);
 
 CRONET_EXPORT void Cronet_TlsConn_Destroy(Cronet_TlsConn* conn);
+
+// Sets or updates the QUIC Brutal send rate (in bytes per second) for the
+// live QUIC session identified by `connection_id` (`(1ULL << 63) | n` from
+// Cronet_BidirectionalStream_GetConnectionId) when the engine negotiated the
+// `BRTL` client connection option. Passing `0` disables fixed-rate sending
+// and falls back to BBR. Safe to call from any thread; unknown or closed
+// `connection_id` values are ignored.
+CRONET_EXPORT void Cronet_Engine_SetQuicSendRate(Cronet_EnginePtr engine,
+                                                 uint64_t connection_id,
+                                                 uint64_t bytes_per_second);
 
 #ifdef __cplusplus
 }

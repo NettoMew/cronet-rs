@@ -1282,8 +1282,12 @@ cronet_api! {
     /// Releases a Cronet_LowerStreamHandle previously handed to a stream dialer or
     /// TLS connection.
     pub fn Cronet_LowerStreamHandle_Destroy(handle: *mut Cronet_LowerStreamHandle);
-    /// Returns the `connection_id` of the transport connection carrying `stream`,
-    /// or 0 if not established over a custom stream dialer.
+    /// Returns the `connection_id` of the transport connection carrying `stream`:
+    /// - for TCP connections opened via a custom stream dialer, the non-zero ID
+    /// passed to `Cronet_StreamDialerFunc` (high bit 0);
+    /// - for QUIC sessions, `(1ULL << 63) | n` (high bit 1), shared by all HTTP/3
+    /// streams multiplexed onto the same QUIC session;
+    /// - 0 for default OS-socket TCP connections or streams not yet bound.
     pub fn Cronet_BidirectionalStream_GetConnectionId(stream: *mut bidirectional_stream) -> u64;
     /// Registers or updates synthetic endpoint metadata (ECHConfigList, comma-
     /// separated ALPNs such as "h2" or "h3,h2", and strict ECH enforcement) for
@@ -1332,6 +1336,13 @@ cronet_api! {
     pub fn Cronet_TlsConn_Read(conn: *mut Cronet_TlsConn, max_bytes: usize);
     pub fn Cronet_TlsConn_Write(conn: *mut Cronet_TlsConn, data: *const u8, length: usize);
     pub fn Cronet_TlsConn_Destroy(conn: *mut Cronet_TlsConn);
+    /// Sets or updates the QUIC Brutal send rate (in bytes per second) for the
+    /// live QUIC session identified by `connection_id` (`(1ULL << 63) | n` from
+    /// Cronet_BidirectionalStream_GetConnectionId) when the engine negotiated the
+    /// `BRTL` client connection option. Passing `0` disables fixed-rate sending
+    /// and falls back to BBR. Safe to call from any thread; unknown or closed
+    /// `connection_id` values are ignored.
+    pub fn Cronet_Engine_SetQuicSendRate(engine: Cronet_EnginePtr, connection_id: u64, bytes_per_second: u64);
     /// Creates a new stream object that uses |engine| and |callback|. All stream
     /// tasks are performed asynchronously on the |engine| network thread. |callback|
     /// methods are invoked synchronously on the |engine| network thread, but must
