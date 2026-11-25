@@ -53,3 +53,7 @@
 - **`Send` futures on `tls::Client::connect`**: `tls::Client::connect` and
   `tls::Client::connect_with` futures are `Send` across `.await` points for
   multi-threaded `tokio::spawn` executors.
+- **Terminal state visibility in final callbacks**: `BidirectionalStream` and
+  `UrlRequest` now mark the stream or request closed before invoking
+  `on_succeeded`, `on_failed`, or `on_canceled`, so operations called inside or
+  woken by a final callback consistently observe `StreamError::Closed`.

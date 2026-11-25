@@ -196,11 +196,17 @@ impl Deref for BidirectionalStream {
 
 impl Drop for BidirectionalStream {
     fn drop(&mut self) {
-        let phase = self.0.state().phase;
+        let phase = {
+            let mut state = self.0.state();
+            let phase = state.phase;
+            if phase == Phase::Created {
+                state.phase = Phase::Done;
+            }
+            phase
+        };
         match phase {
             // No callback can come: free it now.
             Phase::Created => {
-                self.0.state().phase = Phase::Done;
                 // SAFETY: the stream never started, so Cronet holds no reference.
                 unsafe { sys::bidirectional_stream_destroy(self.0.raw.as_ptr()) };
             }
@@ -577,8 +583,9 @@ unsafe extern "C" fn on_canceled(raw: *mut sys::bidirectional_stream) {
     unsafe { finish(raw, |callback, stream| callback.on_canceled(stream)) }
 }
 
-/// Reports how the stream ended, then frees everything: no callback follows a
-/// final one, so the C stream, the buffers and Cronet's reference can go.
+/// Marks the stream done, reports how it ended, and then frees everything: the
+/// terminal state is visible to the callback and any thread it wakes, while the
+/// C stream, any in-flight buffers and Cronet's reference outlive the callback.
 ///
 /// # Safety
 ///
@@ -587,12 +594,12 @@ unsafe fn finish(raw: *mut sys::bidirectional_stream, report: impl FnOnce(&mut d
     let _network = NetworkThread::enter();
     // SAFETY: the stream started, and this is its final callback.
     let stream = unsafe { stream(raw) };
-    report(&mut **stream.callback(), stream);
     let buffers = {
         let mut state = stream.state();
         state.phase = Phase::Done;
         (state.read.take(), std::mem::take(&mut state.writes))
     };
+    report(&mut **stream.callback(), stream);
     // SAFETY: no callback follows; destruction is posted, so the C stream
     // stays valid until this callback returns.
     unsafe { sys::bidirectional_stream_destroy(raw) };

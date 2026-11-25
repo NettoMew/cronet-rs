@@ -676,13 +676,16 @@ impl Shared {
     }
 
     fn end(&self, end: End) {
-        let mut state = self.state();
-        state.end.get_or_insert(end);
-        state.reading = false;
-        if let Some(waker) = state.head_waker.take() {
+        let (head_waker, body_waker) = {
+            let mut state = self.state();
+            state.end.get_or_insert(end);
+            state.reading = false;
+            (state.head_waker.take(), state.body_waker.take())
+        };
+        if let Some(waker) = head_waker {
             waker.wake();
         }
-        if let Some(waker) = state.body_waker.take() {
+        if let Some(waker) = body_waker {
             waker.wake();
         }
     }
@@ -696,12 +699,17 @@ struct Handler {
 
 impl Handler {
     fn respond(&self, info: &UrlResponseInfoRef, empty: bool) {
-        let mut state = self.shared.state();
-        if state.head.is_none() && !state.head_taken {
-            state.head = Some((head(info), empty));
-            if let Some(waker) = state.head_waker.take() {
-                waker.wake();
+        let waker = {
+            let mut state = self.shared.state();
+            if state.head.is_none() && !state.head_taken {
+                state.head = Some((head(info), empty));
+                state.head_waker.take()
+            } else {
+                None
             }
+        };
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 }
@@ -727,14 +735,17 @@ impl UrlRequestCallback for Handler {
     }
 
     fn on_read_completed(&mut self, _: &UrlRequest, _: &UrlResponseInfoRef, buffer: Buffer, bytes_read: u64) {
-        let mut state = self.shared.state();
-        state.reading = false;
-        let n = usize::try_from(bytes_read).unwrap_or(usize::MAX).min(buffer.len());
-        if n > 0 {
-            state.chunk = Some(Bytes::copy_from_slice(&buffer[..n]));
-        }
-        state.buffer = Some(buffer);
-        if let Some(waker) = state.body_waker.take() {
+        let waker = {
+            let mut state = self.shared.state();
+            state.reading = false;
+            let n = usize::try_from(bytes_read).unwrap_or(usize::MAX).min(buffer.len());
+            if n > 0 {
+                state.chunk = Some(Bytes::copy_from_slice(&buffer[..n]));
+            }
+            state.buffer = Some(buffer);
+            state.body_waker.take()
+        };
+        if let Some(waker) = waker {
             waker.wake();
         }
     }

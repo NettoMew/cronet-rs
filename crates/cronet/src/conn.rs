@@ -100,15 +100,31 @@ enum Ended {
     Canceled,
 }
 
+struct Wakers {
+    read: Option<Waker>,
+    write: Option<Waker>,
+    headers: Vec<Waker>,
+}
+
+impl Wakers {
+    fn wake(self) {
+        if let Some(waker) = self.read {
+            waker.wake();
+        }
+        if let Some(waker) = self.write {
+            waker.wake();
+        }
+        self.headers.into_iter().for_each(Waker::wake);
+    }
+}
+
 impl State {
-    fn wake_all(&mut self) {
-        if let Some(waker) = self.read_waker.take() {
-            waker.wake();
+    fn take_wakers(&mut self) -> Wakers {
+        Wakers {
+            read: self.read_waker.take(),
+            write: self.write_waker.take(),
+            headers: std::mem::take(&mut self.headers_wakers),
         }
-        if let Some(waker) = self.write_waker.take() {
-            waker.wake();
-        }
-        self.headers_wakers.drain(..).for_each(Waker::wake);
     }
 
     /// Why nothing more can happen, if so.
@@ -141,14 +157,14 @@ impl Shared {
     }
 
     fn end(&self, ended: Ended) {
-        let on_end = {
+        let (wakers, on_end) = {
             let mut state = self.state();
             state.ended.get_or_insert(ended);
             state.reading = false;
             state.writing = false;
-            state.wake_all();
-            state.on_end.take()
+            (state.take_wakers(), state.on_end.take())
         };
+        wakers.wake();
         if let Some(on_end) = on_end {
             on_end();
         }
@@ -160,9 +176,12 @@ struct Events(Arc<Shared>);
 
 impl StreamCallback for Events {
     fn on_stream_ready(&mut self, _: &Stream) {
-        let mut state = self.0.state();
-        state.ready = true;
-        state.wake_all();
+        let wakers = {
+            let mut state = self.0.state();
+            state.ready = true;
+            state.take_wakers()
+        };
+        wakers.wake();
     }
 
     fn on_response_headers_received(&mut self, _: &Stream, headers: &Headers<'_>, negotiated_protocol: &str) {
@@ -173,27 +192,36 @@ impl StreamCallback for Events {
                 .collect(),
             negotiated_protocol: negotiated_protocol.to_owned(),
         };
-        let mut state = self.0.state();
-        state.headers = Some(headers);
-        state.wake_all();
+        let wakers = {
+            let mut state = self.0.state();
+            state.headers = Some(headers);
+            state.take_wakers()
+        };
+        wakers.wake();
     }
 
     fn on_read_completed(&mut self, _: &Stream, buffer: BytesMut, bytes_read: usize) {
-        let mut state = self.0.state();
-        state.reading = false;
-        if bytes_read == 0 {
-            state.eof = true;
-        }
-        state.received = buffer;
-        if let Some(waker) = state.read_waker.take() {
+        let waker = {
+            let mut state = self.0.state();
+            state.reading = false;
+            if bytes_read == 0 {
+                state.eof = true;
+            }
+            state.received = buffer;
+            state.read_waker.take()
+        };
+        if let Some(waker) = waker {
             waker.wake();
         }
     }
 
     fn on_write_completed(&mut self, _: &Stream, _: Bytes) {
-        let mut state = self.0.state();
-        state.writing = false;
-        if let Some(waker) = state.write_waker.take() {
+        let waker = {
+            let mut state = self.0.state();
+            state.writing = false;
+            state.write_waker.take()
+        };
+        if let Some(waker) = waker {
             waker.wake();
         }
     }
@@ -279,11 +307,12 @@ impl BidirectionalConn {
 
     /// Cancels the stream. Reads and writes fail from now on.
     pub fn close(&self) {
-        {
+        let wakers = {
             let mut state = self.shared.state();
             state.closed = true;
-            state.wake_all();
-        }
+            state.take_wakers()
+        };
+        wakers.wake();
         self.stream.cancel();
     }
 

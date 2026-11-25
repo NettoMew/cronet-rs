@@ -222,6 +222,159 @@ async fn callbacks_see_headers_data_trailers_and_the_end() {
     );
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ReentrantProbe {
+    kind: &'static str,
+    debug_done: bool,
+    start: Result<(), StreamError>,
+    read: Result<(), StreamError>,
+    write: Result<(), StreamError>,
+}
+
+struct ProbeOnEnd {
+    url: String,
+    report: mpsc::Sender<ReentrantProbe>,
+}
+
+impl ProbeOnEnd {
+    fn probe(&self, kind: &'static str, stream: &Stream) {
+        let debug_done = format!("{stream:?}").contains("Done");
+        let start = stream.start("GET", &self.url, NO_HEADERS, StreamPriority::Medium, true);
+        let read = stream.read(BytesMut::with_capacity(64));
+        let write = stream.write(Bytes::from_static(b"late"), false);
+        stream.flush();
+        stream.disable_auto_flush(true);
+        stream.delay_request_headers_until_flush(true);
+        stream.cancel();
+        let _ = self.report.send(ReentrantProbe {
+            kind,
+            debug_done,
+            start,
+            read,
+            write,
+        });
+    }
+}
+
+impl StreamCallback for ProbeOnEnd {
+    fn on_response_headers_received(&mut self, stream: &Stream, _: &Headers<'_>, _: &str) {
+        let _ = stream.read(BytesMut::with_capacity(1024));
+    }
+
+    fn on_read_completed(&mut self, stream: &Stream, _: BytesMut, bytes_read: usize) {
+        if bytes_read > 0 {
+            let _ = stream.read(BytesMut::with_capacity(1024));
+        }
+    }
+
+    fn on_succeeded(&mut self, stream: &Stream) {
+        self.probe("succeeded", stream);
+    }
+
+    fn on_failed(&mut self, stream: &Stream, _: NetError) {
+        self.probe("failed", stream);
+    }
+
+    fn on_canceled(&mut self, stream: &Stream) {
+        self.probe("canceled", stream);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn final_callbacks_observe_closed_stream_for_all_operations() {
+    if !common::library() {
+        return;
+    }
+    let (engine, address) = setup().await;
+    let url = format!("https://{address}/hello");
+
+    // 1. Succeeded terminal callback.
+    let (tx, rx) = mpsc::channel();
+    let ok_stream = BidirectionalStream::new(
+        &engine,
+        ProbeOnEnd {
+            url: url.clone(),
+            report: tx,
+        },
+    );
+    ok_stream
+        .start("GET", &url, NO_HEADERS, StreamPriority::Medium, true)
+        .unwrap();
+    let probe = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(10)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        probe,
+        ReentrantProbe {
+            kind: "succeeded",
+            debug_done: true,
+            start: Err(StreamError::Closed),
+            read: Err(StreamError::Closed),
+            write: Err(StreamError::Closed),
+        }
+    );
+
+    // 2. Failed terminal callback (closed local port).
+    let dead_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let dead_url = format!("https://127.0.0.1:{dead_port}/hello");
+    let (tx, rx) = mpsc::channel();
+    let fail_stream = BidirectionalStream::new(
+        &engine,
+        ProbeOnEnd {
+            url: dead_url.clone(),
+            report: tx,
+        },
+    );
+    fail_stream
+        .start("GET", &dead_url, NO_HEADERS, StreamPriority::Medium, true)
+        .unwrap();
+    let probe = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(10)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        probe,
+        ReentrantProbe {
+            kind: "failed",
+            debug_done: true,
+            start: Err(StreamError::Closed),
+            read: Err(StreamError::Closed),
+            write: Err(StreamError::Closed),
+        }
+    );
+
+    // 3. Canceled terminal callback.
+    let echo_url = format!("https://{address}/echo");
+    let (tx, rx) = mpsc::channel();
+    let cancel_stream = BidirectionalStream::new(
+        &engine,
+        ProbeOnEnd {
+            url: echo_url.clone(),
+            report: tx,
+        },
+    );
+    cancel_stream
+        .start("POST", &echo_url, NO_HEADERS, StreamPriority::Medium, false)
+        .unwrap();
+    cancel_stream.cancel();
+    let probe = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(10)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        probe,
+        ReentrantProbe {
+            kind: "canceled",
+            debug_done: true,
+            start: Err(StreamError::Closed),
+            read: Err(StreamError::Closed),
+            write: Err(StreamError::Closed),
+        }
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn conn_echoes_and_half_closes() {
     if !common::library() {

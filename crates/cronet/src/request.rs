@@ -661,8 +661,9 @@ unsafe extern "C" fn on_canceled(
     }
 }
 
-/// Reports the end, then releases Cronet's reference: once nothing else holds
-/// the request, it is destroyed, which Cronet allows from its final callback.
+/// Marks the request done, reports the end, and then releases Cronet's
+/// reference: once nothing else holds the request, it is destroyed, which
+/// Cronet allows from its final callback.
 ///
 /// # Safety
 ///
@@ -673,7 +674,7 @@ unsafe fn finish(
 ) {
     // SAFETY: the final callback has not returned.
     let request = unsafe { request(callback) };
-    report(&mut **request.callback(), &request);
     *request.phase() = Phase::Done;
+    report(&mut **request.callback(), &request);
     drop(ManuallyDrop::into_inner(request));
 }

@@ -60,7 +60,12 @@ impl UrlRequestCallback for Collect {
         request.read(buffer).unwrap();
     }
 
-    fn on_succeeded(&mut self, _: &UrlRequest, _: &UrlResponseInfoRef) {
+    fn on_succeeded(&mut self, request: &UrlRequest, _: &UrlResponseInfoRef) {
+        assert!(format!("{request:?}").contains("Done"), "{request:?}");
+        assert_eq!(
+            request.start(),
+            Err(cronet::ApiError::IllegalStateRequestAlreadyStarted)
+        );
         let body = std::mem::take(&mut self.body);
         self.done
             .send(Outcome::Succeeded {
@@ -71,11 +76,13 @@ impl UrlRequestCallback for Collect {
             .unwrap();
     }
 
-    fn on_failed(&mut self, _: &UrlRequest, _: Option<&UrlResponseInfoRef>, error: &ErrorRef) {
+    fn on_failed(&mut self, request: &UrlRequest, _: Option<&UrlResponseInfoRef>, error: &ErrorRef) {
+        assert!(format!("{request:?}").contains("Done"), "{request:?}");
         self.done.send(Outcome::Failed(error.to_string())).unwrap();
     }
 
-    fn on_canceled(&mut self, _: &UrlRequest, _: Option<&UrlResponseInfoRef>) {
+    fn on_canceled(&mut self, request: &UrlRequest, _: Option<&UrlResponseInfoRef>) {
+        assert!(format!("{request:?}").contains("Done"), "{request:?}");
         self.done.send(Outcome::Canceled).unwrap();
     }
 }
