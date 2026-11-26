@@ -466,6 +466,8 @@ pub type Cronet_RequestFinishedInfoListener_OnRequestFinishedFunc = Option<
 /// address: IP address string (e.g. "1.2.3.4" or "::1").
 /// port: Port number.
 /// Returns: connected socket fd on success, negative net error code on failure.
+/// Called on a blocking thread pool worker; it may block until the connection
+/// is established. A socket returned after the request was abandoned is closed.
 /// Common error codes:
 /// -102: ERR_CONNECTION_REFUSED
 /// -104: ERR_CONNECTION_FAILED
@@ -484,6 +486,9 @@ pub type Cronet_DialerFunc =
 /// out_local_port: Output pointer for local port number.
 /// out_socket_id: Opaque identifier passed to on_close; zero skips notification.
 /// Returns: socket fd on success, negative net error code on failure.
+/// Called on a blocking thread pool worker for asynchronous connects; it may
+/// block. A socket returned after the request was abandoned is closed and its
+/// on_close is notified.
 /// The returned socket can be:
 /// - AF_INET/AF_INET6 SOCK_DGRAM: Standard UDP socket
 /// - AF_UNIX SOCK_DGRAM: Unix domain datagram socket (Unix/macOS/Linux)
